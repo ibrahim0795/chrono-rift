@@ -1,13 +1,13 @@
-CXX = g++
+CXX      = g++
 CXXFLAGS = -Wall -Wextra -std=c++17 -pthread
 
-# SFML GUI choice:
+# SFML GUI
 LIBS = -lsfml-graphics -lsfml-window -lsfml-audio -lsfml-network -lsfml-system -lrt
 
-# Added .bin extensions to avoid folder name collisions
+# .bin extension to avoid collision with folder names
 TARGETS = arbiter.bin hip.bin asp.bin
 
-all: clean $(TARGETS)	
+all: clean $(TARGETS)
 	@echo Build complete.
 
 arbiter.bin: arbiter/arbiter.cpp
