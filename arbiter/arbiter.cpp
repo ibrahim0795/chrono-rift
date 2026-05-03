@@ -29,13 +29,13 @@
 using namespace std;
 
 // ─── Window / layout constants ───────────────────────────────────────────────
-static const int   WIN_W     = 1280;
+static const int   WIN_W     = 1500;
 static const int   WIN_H     = 720;
 static const float GROUND_Y  = WIN_H * 0.72f;   // Y of character feet
 static const float P_X1      = 80.f;
 static const float P_X2      = 440.f;
-static const float E_X1      = 840.f;
-static const float E_X2      = 1200.f;
+static const float E_X1      = 760.f;
+static const float E_X2      = 1220.f;
 
 // ─── Sprite sheet constants ──────────────────────────────────────────────────
 // players.png      : 640x128  – 5 heroes, each 128×128, one idle pose per hero
@@ -120,11 +120,18 @@ void* stun_resume_thread(void* arg) {
     kill(a->pid, SIGCONT);
     delete a; return nullptr;
 }
-void trigger_stun(pid_t pid, bool pg) {
+void trigger_stun(pid_t pid, bool pg, int target_idx=-1) {
     if (pid <= 0) return;
     pthread_mutex_lock(&gs->memory_lock);
-    if (pg) for (int i=0;i<gs->num_players;i++) { if(gs->players[i].is_alive) gs->players[i].is_stunned=true; }
-    else    for (int i=0;i<gs->num_enemies;i++) { if(gs->enemies[i].is_alive) gs->enemies[i].is_stunned=true; }
+    // Only stun the specific target entity, not the entire group
+    if (target_idx >= 0) {
+        if (pg && target_idx < gs->num_players) { 
+            if (gs->players[target_idx].is_alive) gs->players[target_idx].is_stunned=true; 
+        }
+        else if (!pg && target_idx < gs->num_enemies) { 
+            if (gs->enemies[target_idx].is_alive) gs->enemies[target_idx].is_stunned=true; 
+        }
+    }
     pthread_mutex_unlock(&gs->memory_lock);
     kill(pid, SIGUSR1);
     StunResumeArgs* a = new StunResumeArgs; a->pid=pid; a->players_group=pg;
@@ -230,11 +237,13 @@ void execute_action() {
             snprintf(gs->action_log,MAX_ACTION_LOG,"Entity %d STRIKES entity %d for %d dmg",actor,target,ae.damage);
             atk_trig.attacker=actor; atk_trig.target=target; atk_trig.fired=true;
             break;
-        case ACTION_EXHAUST:
+        case ACTION_EXHAUST: {
             te.stamina-=ae.damage; if(te.stamina<0)te.stamina=0; ae.stamina=0;
             snprintf(gs->action_log,MAX_ACTION_LOG,"Entity %d EXHAUSTS entity %d",actor,target);
-            trigger_stun(tp?gs->hip_pid:gs->asp_pid,tp);
+            int target_idx = tp ? target : (target - MAX_PLAYERS);
+            trigger_stun(tp?gs->hip_pid:gs->asp_pid, tp, target_idx);
             break;
+        }
         case ACTION_USE_WEAPON:
             if(wpn>=0&&wpn<WPN_COUNT){
                 te.hp-=WPN_DAMAGE[wpn]; ae.stamina=0;
@@ -306,18 +315,21 @@ sf::Vector2f player_foot(int i, int n) {
     return {x, y};
 }
 sf::Vector2f enemy_foot(int i, int n) {
-    float x = (n<=1) ? (E_X1+E_X2)/2.f : E_X1+(E_X2-E_X1)*((float)i/(n-1));
-    float y  = GROUND_Y - (float)i*14.f;
+    float x = (n<=1) ? (E_X1+E_X2)/2.f : 600+(E_X2-E_X1)*((float)1.5f*i/(n));
+    float y  = GROUND_Y - (float)i*4.f;   // slight depth offset
     return {x, y};
 }
 
 // Draws HP + Stamina bars above a character
 void draw_bars(sf::RenderWindow& win, sf::Font& font,
                float cx, float foot_y, int hp, int mhp, int sp, int msp,
-               bool dead, const char* name)
+               bool dead, const char* name, bool compact=false)
 {
     if(dead) return;
-    float bw=80.f, bh=8.f, bx=cx-bw/2.f, by=foot_y-CELL_H-24.f;
+    float bw=compact ? 44.f : 80.f;
+    float bh=8.f;
+    float bx=cx-bw/2.f;
+    float by=foot_y-CELL_H-24.f;
     sf::RectangleShape bg({bw+4.f, bh*2.f+8.f});
     bg.setFillColor({0,0,0,180}); bg.setPosition(bx-2.f,by-2.f); win.draw(bg);
 
@@ -328,8 +340,18 @@ void draw_bars(sf::RenderWindow& win, sf::Font& font,
     float sr=(float)sp/msp; if(sr<0)sr=0; if(sr>1)sr=1;
     sf::RectangleShape sbar({bw*sr,bh-2.f}); sbar.setFillColor({255,200,0}); sbar.setPosition(bx,by+bh+2.f); win.draw(sbar);
 
-    sf::Text t(name,font,11); t.setFillColor({220,220,255});
+    sf::Text t(name,font,compact ? 10u : 11u); t.setFillColor({220,220,255});
     sf::FloatRect tb=t.getLocalBounds(); t.setPosition(cx-tb.width/2.f,by-16.f); win.draw(t);
+
+    char vals[32];
+    if (compact)
+        snprintf(vals, sizeof(vals), "%d/%d  %d/%d", hp, mhp, sp, msp);
+    else
+        snprintf(vals, sizeof(vals), "%d/%d  %d/%d", hp, mhp, sp, msp);
+    sf::Text v(vals, font, compact ? 8u : 9u);
+    v.setFillColor({200,200,200});
+    sf::FloatRect vb = v.getLocalBounds();
+    v.setPosition(cx-vb.width/2.f, by+bh+12.f); win.draw(v);
 }
 
 // Draws slash particles at (sx,sy) with progress 0..1
@@ -353,72 +375,72 @@ void draw_slash(sf::RenderWindow& win, float sx, float sy, float p) {
 }
 
 // Draws the arena environment
-void draw_arena_bg(sf::RenderWindow& win, float t) {
-    // Sky
-    sf::RectangleShape sky({(float)WIN_W,(float)WIN_H});
-    sky.setFillColor({14,11,26}); win.draw(sky);
+// void draw_arena_bg(sf::RenderWindow& win, float t) {
+//     // Sky
+//     sf::RectangleShape sky({(float)WIN_W,(float)WIN_H});
+//     sky.setFillColor({14,11,26}); win.draw(sky);
 
-    // Stars
-    for(int s=0;s<100;s++){
-        float sx=(float)((s*173+41)%WIN_W);
-        float sy=(float)((s*113+7) %(int)(WIN_H*0.65f));
-        float tw=0.5f+0.5f*sinf(t*1.8f+s*0.9f);
-        sf::CircleShape star(1.3f);
-        star.setFillColor({255,255,255,(sf::Uint8)(60+80*tw)});
-        star.setPosition(sx,sy); win.draw(star);
-    }
+//     // Stars
+//     for(int s=0;s<100;s++){
+//         float sx=(float)((s*173+41)%WIN_W);
+//         float sy=(float)((s*113+7) %(int)(WIN_H*0.65f));
+//         float tw=0.5f+0.5f*sinf(t*1.8f+s*0.9f);
+//         sf::CircleShape star(1.3f);
+//         star.setFillColor({255,255,255,(sf::Uint8)(60+80*tw)});
+//         star.setPosition(sx,sy); win.draw(star);
+//     }
 
-    // Mountains (parallax layers)
-    struct Mt { float x,y,w,h; sf::Color c; };
-    Mt mts[]={
-        {  0, GROUND_Y-260,340,260,{38,28,50}},
-        {280, GROUND_Y-210,310,210,{45,35,58}},
-        {560, GROUND_Y-290,360,290,{33,24,44}},
-        {870, GROUND_Y-230,320,230,{42,32,54}},
-        {1100,GROUND_Y-270,340,270,{36,27,48}},
-    };
-    for(auto& m:mts){
-        sf::ConvexShape tri(3);
-        tri.setPoint(0,{m.x,          m.y+m.h});
-        tri.setPoint(1,{m.x+m.w/2.f, m.y    });
-        tri.setPoint(2,{m.x+m.w,     m.y+m.h});
-        tri.setFillColor(m.c); win.draw(tri);
-    }
+//     // Mountains (parallax layers)
+//     struct Mt { float x,y,w,h; sf::Color c; };
+//     Mt mts[]={
+//         {  0, GROUND_Y-260,340,260,{38,28,50}},
+//         {280, GROUND_Y-210,310,210,{45,35,58}},
+//         {560, GROUND_Y-290,360,290,{33,24,44}},
+//         {870, GROUND_Y-230,320,230,{42,32,54}},
+//         {1100,GROUND_Y-270,340,270,{36,27,48}},
+//     };
+//     for(auto& m:mts){
+//         sf::ConvexShape tri(3);
+//         tri.setPoint(0,{m.x,          m.y+m.h});
+//         tri.setPoint(1,{m.x+m.w/2.f, m.y    });
+//         tri.setPoint(2,{m.x+m.w,     m.y+m.h});
+//         tri.setFillColor(m.c); win.draw(tri);
+//     }
 
-    // Ground platform
-    sf::RectangleShape gnd({(float)WIN_W,(float)WIN_H*0.30f});
-    gnd.setPosition(0.f,GROUND_Y); gnd.setFillColor({28,20,38}); win.draw(gnd);
+//     // // Ground platform
+//     // sf::RectangleShape gnd({(float)WIN_W,(float)WIN_H*0.30f});
+//     // gnd.setPosition(0.f,GROUND_Y); gnd.setFillColor({28,20,38}); win.draw(gnd);
 
-    // Ground edge highlight
-    sf::RectangleShape gl({(float)WIN_W,3.f});
-    gl.setPosition(0.f,GROUND_Y-1.f); gl.setFillColor({110,75,160}); win.draw(gl);
+//     // // Ground edge highlight
+//     // sf::RectangleShape gl({(float)WIN_W,3.f});
+//     // gl.setPosition(0.f,GROUND_Y-1.f); gl.setFillColor({110,75,160}); win.draw(gl);
 
-    // Tile pattern
-    for(int r=0;r<6;r++) for(int c=0;c<17;c++){
-        sf::RectangleShape tile({79.f,79.f});
-        tile.setPosition((float)(c*80),(float)(GROUND_Y+r*80));
-        tile.setFillColor((r+c)%2==0?sf::Color{36,26,46}:sf::Color{30,22,40});
-        win.draw(tile);
-    }
+//     // // Tile pattern
+//     // for(int r=0;r<6;r++) for(int c=0;c<17;c++){
+//     //     sf::RectangleShape tile({79.f,79.f});
+//     //     tile.setPosition((float)(c*80),(float)(GROUND_Y+r*80));
+//     //     tile.setFillColor((r+c)%2==0?sf::Color{36,26,46}:sf::Color{30,22,40});
+//     //     win.draw(tile);
+//     // }
 
-    // Glowing arena center line
-    sf::RectangleShape cline({2.f,(float)WIN_H*0.30f});
-    cline.setPosition((float)WIN_W/2.f-1.f, GROUND_Y);
-    cline.setFillColor({130,80,200,50}); win.draw(cline);
+//     // // Glowing arena center line
+//     // sf::RectangleShape cline({2.f,(float)WIN_H*0.30f});
+//     // cline.setPosition((float)WIN_W/2.f-1.f, GROUND_Y);
+//     // cline.setFillColor({130,80,200,50}); win.draw(cline);
 
-    // Torch columns (left & right edges of arena)
-    for(int side=0;side<2;side++){
-        float tx=(side==0)?50.f:(float)WIN_W-50.f;
-        float ty=GROUND_Y;
-        sf::RectangleShape pole({10.f,100.f}); pole.setFillColor({65,45,28});
-        pole.setPosition(tx-5.f,ty-100.f); win.draw(pole);
-        float flk=0.85f+0.15f*sinf(t*9.f+side*3.f);
-        sf::CircleShape fl(16.f*flk,8); fl.setFillColor({255,(sf::Uint8)(90+40*sinf(t*7.f)),0,230});
-        fl.setOrigin(16.f,16.f); fl.setPosition(tx,ty-112.f); win.draw(fl);
-        sf::CircleShape fi(8.f,8); fi.setFillColor({255,225,100,200});
-        fi.setOrigin(8.f,8.f); fi.setPosition(tx,ty-112.f); win.draw(fi);
-    }
-}
+//     // Torch columns (left & right edges of arena)
+//     for(int side=0;side<2;side++){
+//         float tx=(side==0)?50.f:(float)WIN_W-50.f;
+//         float ty=GROUND_Y;
+//         sf::RectangleShape pole({10.f,100.f}); pole.setFillColor({65,45,28});
+//         pole.setPosition(tx-5.f,ty-100.f); win.draw(pole);
+//         float flk=0.85f+0.15f*sinf(t*9.f+side*3.f);
+//         sf::CircleShape fl(16.f*flk,8); fl.setFillColor({255,(sf::Uint8)(90+40*sinf(t*7.f)),0,230});
+//         fl.setOrigin(16.f,16.f); fl.setPosition(tx,ty-112.f); win.draw(fl);
+//         sf::CircleShape fi(8.f,8); fi.setFillColor({255,225,100,200});
+//         fi.setOrigin(8.f,8.f); fi.setPosition(tx,ty-112.f); win.draw(fi);
+//     }
+// }
 
 // ─── Render thread ────────────────────────────────────────────────────────────
 void* render_thread_func(void*) {
@@ -439,13 +461,17 @@ void* render_thread_func(void*) {
     if (!font.loadFromFile("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"))
         font.loadFromFile("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
 
-    // ── Load textures (from sprites/ folder next to binary) ──────────────
-    sf::Texture texP, texS, texR, texB;
+    // ── Load textures (from Sprites/ folder next to binary) ─────────────
+    sf::Texture texP, texS, texR, texB, background_texture, attack_texture;
     bool hasP = texP.loadFromFile("Sprites/players.png");
     bool hasS = texS.loadFromFile("Sprites/enemy_silver_flip.png");
     bool hasR = texR.loadFromFile("Sprites/enemy_red_flip.png");
     bool hasB = texB.loadFromFile("Sprites/enemy_blue_flip.png");
+    bool hasBg = background_texture.loadFromFile("Sprites/backgrounds_2.jpeg");
+    // bool hasAttack = attack_texture.loadFromFile("Sprites/Attack.png");
     texP.setSmooth(false); texS.setSmooth(false); texR.setSmooth(false); texB.setSmooth(false);
+    background_texture.setSmooth(false);
+    // attack_texture.setSmooth(false);
 
     // Per-entity idle animation state
     float idle_t[MAX_PLAYERS+MAX_ENEMIES]   = {};
@@ -454,6 +480,11 @@ void* render_thread_func(void*) {
 
     // Per-entity hit-flash 0..1
     float flash[MAX_PLAYERS+MAX_ENEMIES] = {};
+
+    // Simple hit overlay: show Attack.jpeg for 1 second on each hit
+    float attack_fx_timer = 0.f;
+    int   attack_fx_target = -1;
+    static const float ATTACK_FX_DUR = 1.f;
 
     // Lunge animation state
     int   lng_actor  = -1, lng_target = -1;
@@ -495,6 +526,8 @@ void* render_thread_func(void*) {
                 if (!lng_hit) {
                     int ti = lng_target;
                     if (ti>=0 && ti<MAX_PLAYERS+MAX_ENEMIES) flash[ti]=1.f;
+                    attack_fx_target = ti;
+                    attack_fx_timer = ATTACK_FX_DUR;
                     lng_hit = true;
                 }
             } else if (p < 1.f) {
@@ -504,10 +537,11 @@ void* render_thread_func(void*) {
             }
         }
 
-        // ── Advance idle animation (skip lunging attacker) ─────────────────
+        // ── Advance idle animation (only used during enemy attack) ─────────
         int ntot = gs->num_players + gs->num_enemies;
         for (int i=0; i<ntot; i++) {
             if (i==lng_actor) continue;
+            if (i>=MAX_PLAYERS) continue;
             idle_t[i]+=dt;
             if (idle_t[i]>=idle_spd) {
                 idle_t[i]=0.f;
@@ -519,10 +553,17 @@ void* render_thread_func(void*) {
         for (int i=0;i<MAX_PLAYERS+MAX_ENEMIES;i++) {
             flash[i]-=dt*3.f; if(flash[i]<0)flash[i]=0;
         }
+        if (attack_fx_timer > 0.f) {
+            attack_fx_timer -= dt;
+            if (attack_fx_timer < 0.f) attack_fx_timer = 0.f;
+        }
 
         // ── Clear + arena bg ──────────────────────────────────────────────
         win.clear({14,11,26});
-        draw_arena_bg(win, now);
+        // draw_arena_bg(win, now);
+        sf::Sprite bg(background_texture);
+        bg.setTextureRect({0,0,WIN_W,WIN_H});
+        win.draw(bg);
 
         int np=gs->num_players, ne=gs->num_enemies;
 
@@ -534,6 +575,16 @@ void* render_thread_func(void*) {
                 spr.setColor({255,gg,gg,255}); return;
             }
             spr.setColor(sf::Color::White);
+        };
+
+        auto draw_flipped_sprite = [&](sf::Texture& tex, int frame, float cx, float fy, bool flip_x, bool dead, float fl) {
+            sf::Sprite spr(tex);
+            spr.setTextureRect({frame*CELL_W, 0, CELL_W, CELL_H});
+            spr.setOrigin(CELL_W/2.f, (float)CELL_H);
+            spr.setScale(flip_x ? -1.f : 1.f, 1.f);
+            spr.setPosition(cx, fy);
+            apply_color(spr, dead, fl);
+            win.draw(spr);
         };
 
         // ── Draw players ──────────────────────────────────────────────────
@@ -563,14 +614,7 @@ void* render_thread_func(void*) {
                 // players.png: 5 different heroes in columns, each CELL_W wide
                 // (idle only — no row animation; each column = 1 hero)
                 int hero_col=i%5;
-                sf::Sprite spr(texP);
-                // Use idle_f for a subtle "bob" — cycle through same hero col
-                // Since we only have 1 pose per hero, we just display static
-                spr.setTextureRect({hero_col*CELL_W,0,CELL_W,CELL_H});
-                spr.setOrigin(CELL_W/2.f,(float)CELL_H);
-                spr.setPosition(cx+ox,fy);
-                apply_color(spr,!p.is_alive,flash[i]);
-                win.draw(spr);
+                draw_flipped_sprite(texP, hero_col, cx+ox, fy, true, !p.is_alive, flash[i]);
             } else {
                 // Fallback: simple rectangle
                 sf::RectangleShape r({40.f,70.f});
@@ -589,7 +633,7 @@ void* render_thread_func(void*) {
                 }
 
             char lbl[16]; snprintf(lbl,sizeof(lbl),"P%d",i+1);
-            draw_bars(win,font,cx+ox,fy,p.hp,p.max_hp,p.stamina,p.max_stamina,!p.is_alive,lbl);
+            draw_bars(win,font,cx+ox,fy,p.hp,p.max_hp,p.stamina,p.max_stamina,!p.is_alive,lbl,false);
         }
 
         // ── Draw enemies ──────────────────────────────────────────────────
@@ -623,15 +667,10 @@ void* render_thread_func(void*) {
             else if (hasB)          et=&texB;
             else if (hasS)          et=&texS;
 
-            int frame=idle_f[eid]%ANIM_FRAMES;
+            int frame = lunging ? (int)(slash_prog * (ANIM_FRAMES - 1)) : 0;
 
             if (et) {
-                sf::Sprite spr(*et);
-                spr.setTextureRect({frame*CELL_W,0,CELL_W,CELL_H});
-                spr.setOrigin(CELL_W/2.f,(float)CELL_H);
-                spr.setPosition(cx+ox,fy);
-                apply_color(spr,!e.is_alive,flash[eid]);
-                win.draw(spr);
+                draw_flipped_sprite(*et, frame, cx+ox, fy, true, !e.is_alive, flash[eid]);
             } else {
                 sf::RectangleShape r({40.f,60.f});
                 r.setFillColor(e.is_alive?sf::Color{200,60,60}:sf::Color{60,60,60});
@@ -649,7 +688,7 @@ void* render_thread_func(void*) {
                 }
 
             char lbl[16]; snprintf(lbl,sizeof(lbl),"E%d",i+1);
-            draw_bars(win,font,cx+ox,fy,e.hp,e.max_hp,e.stamina,e.max_stamina,!e.is_alive,lbl);
+            draw_bars(win,font,cx+ox,fy,e.hp,e.max_hp,e.stamina,e.max_stamina,!e.is_alive,lbl,true);
         }
 
         // ── Slash effect at target ────────────────────────────────────────
@@ -665,6 +704,37 @@ void* render_thread_func(void*) {
                 else { sx=WIN_W/2.f; sy=GROUND_Y-60.f; }
             }
             draw_slash(win,sx,sy,slash_prog);
+        }
+
+        // ── Attack hit overlay (1 second) ────────────────────────────────
+        // if (hasAttack && attack_fx_timer > 0.f && attack_fx_target >= 0) 
+        if ( attack_fx_timer > 0.f && attack_fx_target >= 0) {
+            float alpha = attack_fx_timer / ATTACK_FX_DUR;
+            // sf::Sprite atk(attack_texture);
+            float ax = WIN_W * 0.5f;
+            float ay = GROUND_Y - 180.f;
+            if (attack_fx_target < MAX_PLAYERS) {
+                sf::Vector2f fp = player_foot(attack_fx_target, np);
+                ax = fp.x;
+                ay = fp.y - CELL_H - 40.f;
+            } else {
+                int ti = attack_fx_target - MAX_PLAYERS;
+                if (ti >= 0 && ti < ne) {
+                    sf::Vector2f fp = enemy_foot(ti, ne);
+                    ax = fp.x;
+                    ay = fp.y - CELL_H - 40.f;
+                }
+            }
+
+            sf::IntRect bounds = attack_texture.getSize().x > 0 && attack_texture.getSize().y > 0
+                ? sf::IntRect(0, 0, (int)attack_texture.getSize().x, (int)attack_texture.getSize().y)
+                : sf::IntRect();
+            // atk.setTextureRect(bounds);
+            // atk.setOrigin((float)bounds.width / 2.f, (float)bounds.height / 2.f);
+            // atk.setPosition(ax, ay);
+            // atk.setScale(0.6f, 0.6f);
+            // atk.setColor({255, 255, 255, (sf::Uint8)(255.f * alpha)});
+            // win.draw(atk);
         }
 
         // ── TOP HUD ───────────────────────────────────────────────────────
