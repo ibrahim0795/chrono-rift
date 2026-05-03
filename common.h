@@ -19,7 +19,7 @@
 #define LAST_DIGIT        5
 #define SECOND_LAST       9
 #define LAST_TWO          95
-#define ROLL_FULL         230795   // used for player HP base
+#define ROLL_FULL         795   // used for player HP base
 
 // ─── Weapon IDs ──────────────────────────────────────────────────────────────
 #define WPN_NONE          -1

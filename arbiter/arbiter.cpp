@@ -34,7 +34,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <SFML/Graphics.hpp>
-#include "../common.h" 
+#include "../common.h"
 
 using namespace std;
 
@@ -213,6 +213,10 @@ void init_game() {
         p.waiting_for = ART_NONE;
         memset(p.inventory, WPN_NONE, sizeof(p.inventory));
         memset(p.long_term,  WPN_NONE, sizeof(p.long_term));
+        
+        // Give each player starting weapons: Iron Halberd and Venom Dagger
+        p.inventory[0] = WPN_IRON_HALBERD;
+        p.inventory[1] = WPN_VENOM_DAGGER;
     }
 
     gs->num_enemies = rand() % 8 + 2;
