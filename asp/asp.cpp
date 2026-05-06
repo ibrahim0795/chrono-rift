@@ -1,19 +1,29 @@
 // ============================================================
 //  asp.cpp  —  Automated Strategic Process (AI)
 //
-//  UPDATED:
-//    • Removed kill(getpid(), SIGSTOP) from stun handler.
-//      Stun is now purely flag-based via is_stunned in shared memory.
-//      The arbiter sets/clears the flag with a timer thread.
-//    • Enemy threads check is_stunned flag before acting.
-//    • All existing OS concepts preserved.
+//  ARCHITECTURAL FIX — Flaw 2 (Stun Mechanic):
 //
-//  OS Concepts used:
-//    • POSIX Shared Memory  (shm_open, mmap)
+//    OLD: Arbiter set is_stunned=true; enemy threads polled the
+//         flag before each action with:  if (e.is_stunned) skip;
+//
+//    NEW:
+//      • Each enemy thread registers its pthread_t in
+//        gs->asp_thread_tids[enemy_idx] at startup.
+//      • When an enemy is stunned, the Arbiter calls:
+//            pthread_kill(gs->asp_thread_tids[i], SIGUSR1)
+//        This delivers SIGUSR1 to that specific thread only.
+//      • The per-thread stun_handler calls sleep(3) INSIDE the
+//        handler body, halting the thread for exactly 3 seconds
+//        from the point of interruption, then resuming normally.
+//      • No game logic code polls is_stunned.  The interruption
+//        is asynchronous and non-blocking for all other threads.
+//
+//  OS Concepts demonstrated:
+//    • POSIX Shared Memory  (shm_open / mmap)
 //    • pthreads: one dedicated thread per enemy NPC
-//    • SIGSTOP/SIGCONT: ultimate ability pause (sent by arbiter)
-//    • SIGUSR1: stun signal (now flag-based — no self-stop)
-//    • Mutex: protect shared state access
+//    • SIGSTOP / SIGCONT: ultimate-ability full-pause (OS-native)
+//    • SIGUSR1 per-thread stun via pthread_kill + sleep(3) in handler
+//    • PTHREAD_PROCESS_SHARED mutex for shared state access
 // ============================================================
 
 #include <iostream>
@@ -25,41 +35,56 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <errno.h>
 #include "../common.h"
 
 using namespace std;
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
-GameState* gs      = nullptr;
-bool       running = true;
+static GameState* gs      = nullptr;
+static bool       running = true;
 
-// ─── Signal handlers ──────────────────────────────────────────────────────────
-
-// Stun: now purely flag-based. Arbiter sets is_stunned=true and clears after 3s.
-// We no longer self-stop here — that would freeze ALL enemy threads, not just one.
-void stun_handler(int sig) {
+// ─── Per-thread stun signal handler ──────────────────────────────────────────
+//
+// DESIGN RATIONALE (satisfies Flaw 2 requirement):
+//
+//   The Arbiter delivers SIGUSR1 to a specific enemy thread via:
+//       pthread_kill(gs->asp_thread_tids[enemy_idx], SIGUSR1)
+//
+//   Calling sleep(3) here suspends ONLY the targeted thread for
+//   3 seconds from the exact moment of signal delivery.  All other
+//   enemy threads (and the main ASP thread) continue running.
+//
+//   After sleep(3) returns, this thread resumes from the point of
+//   interruption.  Typically it was either:
+//     (a) Waiting in the usleep(50000) spin for active_turn, or
+//     (b) Waiting in the usleep(20000) spin for pending_action.
+//   Both loops simply retry after the handler returns — the Arbiter's
+//   turn-timeout will have advanced active_turn, so the thread finds
+//   it is no longer this enemy's turn and idles until next time.
+//
+static void stun_handler(int sig) {
     (void)sig;
-    // Flag is handled by arbiter. Nothing to do here.
+    sleep(3);  // halt this thread — and only this thread — for 3 seconds
 }
 
-void sigterm_handler(int sig) {
+static void sigterm_handler(int sig) {
     (void)sig;
     running = false;
 }
 
-// SIGSTOP/SIGCONT for ultimate ability are handled by the OS automatically.
+// SIGSTOP / SIGCONT for the ultimate ability are delivered to the
+// entire ASP process and handled automatically by the OS.
 
 // ─── Enemy AI decision ────────────────────────────────────────────────────────
-// Simple AI: always strike the first alive player (80% chance), else skip.
-void enemy_decide(int enemy_idx) {
+// Simple AI: strike the first alive player with 80% probability, else skip.
+static void enemy_decide(int enemy_idx) {
     int target = -1;
-    for (int i = 0; i < gs->num_players; i++) {
+    for (int i = 0; i < gs->num_players; i++)
         if (gs->players[i].is_alive) { target = i; break; }
-    }
     if (target == -1) return;
 
-    int roll = rand() % 10;
-    if (roll < 8) {
+    if (rand() % 10 < 8) {
         gs->action_actor   = MAX_PLAYERS + enemy_idx;
         gs->action_target  = target;
         gs->pending_action = ACTION_STRIKE;
@@ -73,44 +98,48 @@ void enemy_decide(int enemy_idx) {
     }
 }
 
-// ─── Enemy thread — one per NPC ───────────────────────────────────────────────
+// ─── Enemy thread ─────────────────────────────────────────────────────────────
 struct EnemyThreadArg { int enemy_index; };
 
-void* enemy_thread_func(void* arg) {
+static void* enemy_thread_func(void* arg) {
     EnemyThreadArg* earg = (EnemyThreadArg*)arg;
-    int idx = earg->enemy_index;
+    const int idx = earg->enemy_index;
+
+    // ── 1. Register this thread's tid for targeted stun signals ───────────
+    gs->asp_thread_tids[idx] = pthread_self();
+
+    // ── 2. Unblock SIGUSR1 in this thread only ─────────────────────────────
+    // main() blocks SIGUSR1 process-wide.  Each enemy thread unblocks it
+    // for itself so only the correct thread receives the stun signal.
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, SIGUSR1);
+    pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
 
     while (running && !gs->is_game_over) {
-        // Safety: bail if this slot is dead
         if (idx >= gs->num_enemies) { usleep(100000); continue; }
+
         Entity& e = gs->enemies[idx];
-        if (!e.is_alive) { usleep(100000); continue; }
+        if (!e.is_alive)  { usleep(100000); continue; }
 
-        // Only act on this enemy's turn
+        // Only act when it is this enemy's turn.
         int my_turn = MAX_PLAYERS + idx;
-        if (gs->active_turn != my_turn) {
-            usleep(50000);
-            continue;
-        }
+        if (gs->active_turn != my_turn) { usleep(50000); continue; }
 
-        // Stunned: skip turn (arbiter will advance turn via timeout)
-        if (e.is_stunned) {
-            gs->action_actor   = my_turn;
-            gs->pending_action = ACTION_SKIP;
-            snprintf(gs->action_log, MAX_ACTION_LOG,
-                     "Enemy %d is stunned — skips!", idx + 1);
-            // Wait for arbiter to clear action
-            while (gs->pending_action != ACTION_NONE && !gs->is_game_over)
-                usleep(20000);
-            continue;
-        }
-
-        // Decide and write action
+        // ── Decide and post action ─────────────────────────────────────────
+        //
+        // If SIGUSR1 arrives here, stun_handler fires immediately and
+        // sleep(3) runs.  After 3 s the handler returns, execution
+        // resumes, and the next loop iteration finds that active_turn
+        // has advanced (Arbiter timeout), so the thread idles cleanly.
+        //
+        // There is NO is_stunned poll here — the stun is fully asynchronous.
+        //
         pthread_mutex_lock(&gs->memory_lock);
         enemy_decide(idx);
         pthread_mutex_unlock(&gs->memory_lock);
 
-        // Wait until arbiter processes our action
+        // Wait for the Arbiter to consume and clear the action.
         while (gs->pending_action != ACTION_NONE && !gs->is_game_over)
             usleep(20000);
     }
@@ -119,15 +148,15 @@ void* enemy_thread_func(void* arg) {
 }
 
 // ─── Attach to shared memory ──────────────────────────────────────────────────
-void attach_shared_memory() {
+static void attach_shared_memory() {
     int fd = -1;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 10 && fd == -1; i++) {
         fd = shm_open(SHARED_MEM_NAME, O_RDWR, 0666);
-        if (fd != -1) break;
-        sleep(1);
+        if (fd == -1) sleep(1);
     }
     if (fd == -1) { perror("ASP: shm_open"); exit(1); }
-    gs = (GameState*)mmap(0, sizeof(GameState),
+
+    gs = (GameState*)mmap(nullptr, sizeof(GameState),
                           PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (gs == MAP_FAILED) { perror("ASP: mmap"); exit(1); }
     close(fd);
@@ -135,19 +164,36 @@ void attach_shared_memory() {
 
 // ─── main ─────────────────────────────────────────────────────────────────────
 int main() {
-    signal(SIGUSR1,  stun_handler);
-    signal(SIGTERM,  sigterm_handler);
-    // SIGSTOP/SIGCONT handled by OS for ultimate ability pause
+    // ── Block SIGUSR1 process-wide; threads unblock it individually ────────
+    sigset_t block_usr1;
+    sigemptyset(&block_usr1);
+    sigaddset(&block_usr1, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &block_usr1, nullptr);
+
+    // Install the stun handler.  SA_RESTART is omitted so that any blocking
+    // syscall (usleep is not blocking, but for correctness) returns EINTR.
+    struct sigaction sa{};
+    sa.sa_handler = stun_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags   = 0;
+    sigaction(SIGUSR1, &sa, nullptr);
+
+    signal(SIGTERM, sigterm_handler);
+    // SIGSTOP / SIGCONT for ultimate ability are handled by the OS.
 
     cout << "ASP: Connecting to shared memory..." << endl;
     attach_shared_memory();
 
     gs->asp_pid = getpid();
     srand(ROLL_SEED + 1);
-    cout << "ASP: Connected. Enemies = " << gs->num_enemies << endl;
 
-    // Pre-create MAX_ENEMIES threads (some may idle if num_enemies < MAX_ENEMIES)
-    pthread_t threads[MAX_ENEMIES];
+    // Zero out thread-tid array — Arbiter checks for 0 before pthread_kill.
+    memset(gs->asp_thread_tids, 0, sizeof(gs->asp_thread_tids));
+
+    cout << "ASP: Connected.  Enemies = " << gs->num_enemies << endl;
+
+    // Spawn one thread per enemy slot (extras idle if num_enemies < MAX_ENEMIES).
+    pthread_t      threads[MAX_ENEMIES];
     EnemyThreadArg args[MAX_ENEMIES];
 
     for (int i = 0; i < MAX_ENEMIES; i++) {

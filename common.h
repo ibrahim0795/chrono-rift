@@ -21,6 +21,12 @@
 #define LAST_TWO          95
 #define ROLL_FULL         795   // used for player HP base
 
+// ─── Named FIFO (Arbiter render thread → HIP player threads) ─────────────────
+// The Arbiter render thread writes one UIEvent struct per player action here.
+// Each HIP player thread reads from this pipe and pushes the event into its
+// per-player PlayerActionBuffer in shared memory.
+#define HIP_PIPE_PATH     "/tmp/chronorift_hip_pipe"
+
 // ─── Weapon IDs ──────────────────────────────────────────────────────────────
 #define WPN_NONE          -1
 #define WPN_SOLAR_CORE     0   // 10 slots, 95 dmg  (artifact)
@@ -39,26 +45,16 @@ static const int WPN_SLOTS[WPN_COUNT]  = {10,10, 7, 4, 6, 5, 6, 2, 10};
 static const int WPN_DAMAGE[WPN_COUNT] = {95,90,55,30,50,45,48,12, 80};
 
 // Weapon names for UI display
-static const char* WPN_NAMES[WPN_COUNT] = {
-    "Solar Core",
-    "Lunar Blade",
-    "Iron Halberd",
-    "Venom Dagger",
-    "Thunderstaff",
-    "Obsidian Axe",
-    "Frostbow",
-    "Splinter Stick",
-    "Eclipse Relic"
-};
+extern const char* WPN_NAMES[WPN_COUNT];
 
 // ─── Action codes ────────────────────────────────────────────────────────────
 #define ACTION_NONE        0
 #define ACTION_STRIKE      1   // reduce enemy HP
-#define ACTION_EXHAUST     2   // reduce enemy stamina (stun mechanic)
+#define ACTION_EXHAUST     2   // reduce enemy stamina → stun via SIGUSR1
 #define ACTION_USE_WEAPON  3   // attack with inventory weapon
 #define ACTION_SWAP_IN     4   // retrieve weapon from long-term storage
 #define ACTION_HEAL        5   // restore 10% HP
-#define ACTION_SKIP        6   // skip turn (stamina -> 50%)
+#define ACTION_SKIP        6   // skip turn (stamina → 50%)
 #define ACTION_QUIT        7   // SIGTERM to arbiter
 #define ACTION_ULTIMATE    8   // trigger ultimate (needs Solar Core + Lunar Blade)
 
@@ -68,9 +64,48 @@ static const char* WPN_NAMES[WPN_COUNT] = {
 #define ART_LUNAR_BLADE    1
 #define ART_ECLIPSE_RELIC  2
 
+// ─── Action ring-buffer capacity ─────────────────────────────────────────────
+#define ACTION_BUF_CAP    8
+
+// ─── UIEvent ─────────────────────────────────────────────────────────────────
+// Written by the Arbiter render thread into HIP_PIPE_PATH when the player
+// clicks a UI element.  Consumed by the matching HIP player thread.
+struct UIEvent {
+    int action;       // ACTION_* code
+    int target;       // entity index (MAX_PLAYERS+i for enemy i), -1 if N/A
+    int weapon_id;    // WPN_* id or -1
+    int player_idx;   // which player's thread should consume this event
+};
+
+// ─── PlayerInputEvent ─────────────────────────────────────────────────────────
+// A fully resolved player decision, stored in the per-player ring-buffer.
+// HIP player threads write these; the Arbiter main loop reads them.
+struct PlayerInputEvent {
+    int  action;
+    int  target;
+    int  weapon_id;
+    bool valid;
+};
+
+// ─── Per-player action ring-buffer ───────────────────────────────────────────
+struct PlayerActionBuffer {
+    PlayerInputEvent events[ACTION_BUF_CAP];
+    int head;    // Arbiter pops here
+    int tail;    // HIP pushes here
+    int count;
+};
+
 // ─── Entity struct ────────────────────────────────────────────────────────────
 struct Entity {
     bool  is_alive;
+    // NOTE on is_stunned:
+    //   This flag is a VISUAL HINT for the renderer only (stun stars, label).
+    //   The authoritative stun mechanic works via SIGUSR1 sent by the Arbiter
+    //   directly to the entity's owning pthread (hip_thread_tids[i] for players,
+    //   asp_thread_tids[i] for enemies) using pthread_kill().  The per-thread
+    //   stun_handler calls sleep(3) inside the handler body, blocking that
+    //   thread for exactly 3 seconds from the point of interruption.
+    //   No game logic code may poll is_stunned to decide whether to take a turn.
     bool  is_stunned;
     int   hp;
     int   max_hp;
@@ -85,30 +120,47 @@ struct Entity {
 
     pid_t pid;
 
-    // Deadlock: which artifact is this entity waiting to acquire?
+    // Deadlock detection: which artifact is this entity waiting to acquire?
     int   waiting_for;
 };
 
 // ─── Weapon drop popup state ─────────────────────────────────────────────────
 struct WeaponDropState {
-    bool  pending;       // true = popup is visible, waiting for player decision
+    bool  pending;       // true = popup visible, awaiting player decision
     int   weapon_id;     // which weapon dropped
-    int   for_player;    // which player index decides (-1 = no player)
-    // decision: 0 = pending, 1 = pick up, 2 = leave
-    int   decision;
+    int   for_player;    // which player index decides (-1 = none)
+    int   decision;      // 0 = pending, 1 = picked up, 2 = left
 };
 
 // ─── Shared game state ───────────────────────────────────────────────────────
 struct GameState {
-    // Synchronization
-    pthread_mutex_t memory_lock;
+    // ── Synchronization ───────────────────────────────────────────────────
+    pthread_mutex_t memory_lock;   // initialised with PTHREAD_PROCESS_SHARED
 
-    // Processes
+    // ── Process PIDs ──────────────────────────────────────────────────────
     pid_t arbiter_pid;
     pid_t hip_pid;
     pid_t asp_pid;
 
-    // Entities
+    // ── Per-player thread IDs (written by HIP at thread startup) ──────────
+    // The Arbiter calls  pthread_kill(hip_thread_tids[i], SIGUSR1)
+    // to deliver a stun signal to exactly player i's thread in the HIP
+    // process, leaving all other player threads running.
+    pthread_t hip_thread_tids[MAX_PLAYERS];
+
+    // ── Per-enemy thread IDs (written by ASP at thread startup) ───────────
+    // The Arbiter calls  pthread_kill(asp_thread_tids[i], SIGUSR1)
+    // to deliver a stun signal to exactly enemy i's thread in the ASP
+    // process, leaving all other enemy threads running.
+    pthread_t asp_thread_tids[MAX_ENEMIES];
+
+    // ── Per-player action buffers ──────────────────────────────────────────
+    // HIP player threads push resolved PlayerInputEvents here.
+    // The Arbiter main loop pops them — it never writes player actions itself,
+    // keeping it a pure engine/visualizer.
+    PlayerActionBuffer player_buffers[MAX_PLAYERS];
+
+    // ── Entities ──────────────────────────────────────────────────────────
     int    num_players;
     Entity players[MAX_PLAYERS];
 
@@ -116,24 +168,26 @@ struct GameState {
     Entity enemies[MAX_ENEMIES];
     int    enemies_killed;
 
-    // Game status
+    // ── Game status ───────────────────────────────────────────────────────
     bool   is_game_over;
     bool   player_won;
     bool   ultimate_pause;
 
-    // Scheduling
+    // ── Scheduling ────────────────────────────────────────────────────────
     int    active_turn;
 
-    // Action pipeline
+    // ── Action pipeline ───────────────────────────────────────────────────
+    // Used by ASP enemy threads (enemies write here; Arbiter reads).
+    // Player actions travel through player_buffers[] instead.
     int    pending_action;
     int    action_actor;
     int    action_target;
     int    action_weapon_id;
 
-    // Weapon drop popup
+    // ── Weapon drop popup ─────────────────────────────────────────────────
     WeaponDropState weapon_drop;
 
-    // Artifacts
+    // ── Artifacts ─────────────────────────────────────────────────────────
     bool   solar_core_exists;
     int    solar_core_holder;
 
@@ -144,7 +198,7 @@ struct GameState {
     int    eclipse_relic_holder;
     bool   eclipse_relic_announced;
 
-    // Action log
+    // ── Action log ────────────────────────────────────────────────────────
     char   action_log[MAX_ACTION_LOG];
 };
 
