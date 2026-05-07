@@ -137,13 +137,35 @@ static int open_hip_pipe_read() {
 // ─── Player thread ─────────────────────────────────────────────────────────────
 struct PlayerThreadArg {
     int player_idx;
-    int pipe_fd;        // shared read-end of the named FIFO
 };
+
+struct ReaderThreadArg {
+    int pipe_fd;
+};
+
+// Single FIFO reader to prevent lost events when multiple threads read the same FD.
+static void* fifo_reader_thread(void* arg) {
+    ReaderThreadArg* a = (ReaderThreadArg*)arg;
+    const int pipefd = a->pipe_fd;
+
+    while (running && !gs->is_game_over) {
+        UIEvent uev{};
+        ssize_t n = read(pipefd, &uev, sizeof(UIEvent));
+        if (n == (ssize_t)sizeof(UIEvent)) {
+            if (uev.player_idx >= 0 && uev.player_idx < gs->num_players)
+                push_player_action(uev.player_idx, uev.action, uev.target, uev.weapon_id);
+        } else if (n == -1 && errno == EINTR) {
+            continue;
+        } else {
+            usleep(10000);
+        }
+    }
+    return nullptr;
+}
 
 static void* player_thread_func(void* arg) {
     PlayerThreadArg* a   = (PlayerThreadArg*)arg;
     const int idx        = a->player_idx;
-    const int pipefd     = a->pipe_fd;
 
     // ── 1. Register this thread's tid so Arbiter can pthread_kill() it ────
     gs->hip_thread_tids[idx] = pthread_self();
@@ -160,52 +182,8 @@ static void* player_thread_func(void* arg) {
     cout << "HIP: Player " << idx + 1
          << " thread ready  (tid=" << pthread_self() << ")" << endl;
 
-    while (running && !gs->is_game_over) {
-
-        // ── Wait for this player's turn ────────────────────────────────────
-        while (running && !gs->is_game_over && gs->active_turn != idx)
-            usleep(20000);
-
-        if (!running || gs->is_game_over) break;
-        if (!gs->players[idx].is_alive)   { usleep(50000); continue; }
-
-        // ── Read one UIEvent addressed to this player from the FIFO ────────
-        //
-        // The Arbiter render thread writes exactly one UIEvent per player
-        // action click into HIP_PIPE_PATH.  Because all player threads share
-        // the same file descriptor, we discard events addressed to other
-        // players and retry.
-        //
-        // If SIGUSR1 fires (stun) while we are blocked in read(), the system
-        // call returns -1 / EINTR.  sleep(3) has already run inside the
-        // stun_handler at that point.  We simply retry the read, which means
-        // the thread resumes polling for its event after the stun expires.
-        //
-        UIEvent uev;
-        bool got = false;
-        while (!got && running && !gs->is_game_over && gs->active_turn == idx) {
-            ssize_t n = read(pipefd, &uev, sizeof(UIEvent));
-            if (n == (ssize_t)sizeof(UIEvent)) {
-                if (uev.player_idx == idx)
-                    got = true;
-                // else: event for a different player — discard and retry
-            } else if (n == -1 && errno == EINTR) {
-                // Interrupted by SIGUSR1 stun — sleep(3) already ran.
-                // Retry the read; if the turn has moved on, outer loop exits.
-                continue;
-            } else {
-                usleep(10000);
-            }
-        }
-
-        if (!got) continue;
-
-        // ── Push the resolved action into shared memory ────────────────────
-        push_player_action(idx, uev.action, uev.target, uev.weapon_id);
-
-        // Small yield so Arbiter can detect the new entry promptly.
-        usleep(10000);
-    }
+    while (running && !gs->is_game_over)
+        usleep(50000);
 
     cout << "HIP: Player " << idx + 1 << " thread exiting." << endl;
     return nullptr;
@@ -248,18 +226,21 @@ int main() {
     }
 
     cout << "HIP: Connected.  Players = " << gs->num_players << endl;
-    cout << "HIP: Opening event pipe from Arbiter..." << endl;
-    int pipe_fd = open_hip_pipe_read();
-    cout << "HIP: Pipe open.  Spawning " << gs->num_players
-         << " player thread(s)." << endl;
+        cout << "HIP: Opening event pipe from Arbiter..." << endl;
+        int pipe_fd = open_hip_pipe_read();
+        cout << "HIP: Pipe open.  Spawning " << gs->num_players
+            << " player thread(s) and FIFO reader." << endl;
 
     // Spawn one pthread per player.
     pthread_t         tids[MAX_PLAYERS];
     PlayerThreadArg   args[MAX_PLAYERS];
+    pthread_t         reader_tid;
+    ReaderThreadArg   reader_arg{pipe_fd};
+
+    pthread_create(&reader_tid, nullptr, fifo_reader_thread, &reader_arg);
 
     for (int i = 0; i < gs->num_players; i++) {
         args[i].player_idx = i;
-        args[i].pipe_fd    = pipe_fd;
         pthread_create(&tids[i], nullptr, player_thread_func, &args[i]);
     }
 
@@ -271,6 +252,8 @@ int main() {
 
     for (int i = 0; i < gs->num_players; i++)
         pthread_join(tids[i], nullptr);
+
+    pthread_join(reader_tid, nullptr);
 
     close(pipe_fd);
     munmap(gs, sizeof(GameState));

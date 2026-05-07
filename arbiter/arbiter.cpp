@@ -412,12 +412,20 @@ static void execute_action() {
     int action = gs->pending_action;
     int wpn    = gs->action_weapon_id;
     bool ap    = (actor  < MAX_PLAYERS);
-    bool tp    = (target < MAX_PLAYERS);
+    auto is_valid_target = [&](int t) {
+        if (t < 0) return false;
+        if (t < MAX_PLAYERS) return t < gs->num_players;
+        int ei = t - MAX_PLAYERS;
+        return ei >= 0 && ei < gs->num_enemies;
+    };
+    bool tp = (target >= 0 && target < MAX_PLAYERS);
 
     Entity& ae = ap ? gs->players[actor] : gs->enemies[actor - MAX_PLAYERS];
     Entity* te_ptr = nullptr;
-    if (action == ACTION_STRIKE || action == ACTION_EXHAUST || action == ACTION_USE_WEAPON)
+    if ((action == ACTION_STRIKE || action == ACTION_EXHAUST || action == ACTION_USE_WEAPON)
+        && is_valid_target(target)) {
         te_ptr = tp ? &gs->players[target] : &gs->enemies[target - MAX_PLAYERS];
+    }
 
     switch (action) {
         case ACTION_STRIKE:
@@ -848,7 +856,7 @@ static void* render_thread_func(void*) {
             if      (i%3==0&&hasS) et=&texS;
             else if (i%3==1&&hasR) et=&texR;
             else if (hasB)         et=&texB;
-            if (et) draw_flipped(*et,0,cx+ox,fy,false,!e.is_alive,flash[eid]);
+            if (et) draw_flipped(*et,0,cx+ox,fy,true,!e.is_alive,flash[eid]);
             else {
                 sf::RectangleShape r({40.f,60.f});
                 r.setFillColor(e.is_alive?sf::Color{220,80,80}:sf::Color{60,60,60});
@@ -862,9 +870,19 @@ static void* render_thread_func(void*) {
                     star.setPosition(cx+ox+cosf(ang)*22.f,fy-CELL_H+sinf(ang)*8.f); win.draw(star);
                 }
             }
+            // Enemy hitbox for targeting (strike/exhaust/use-weapon)
+            sf::FloatRect hitbox(cx+ox-28.f, fy-(float)CELL_H, 56.f, (float)CELL_H);
+            if (e.is_alive && (ui_mode==1||ui_mode==2||ui_mode==5)) {
+                sf::RectangleShape hb({hitbox.width, hitbox.height});
+                hb.setPosition(hitbox.left, hitbox.top);
+                hb.setFillColor({0,0,0,0});
+                hb.setOutlineThickness(2.f);
+                hb.setOutlineColor({255,220,0,200});
+                win.draw(hb);
+            }
+
             // Enemy click for targeting (strike/exhaust/use-weapon)
             if (e.is_alive && (ui_mode==1||ui_mode==2||ui_mode==5) && left_clicked) {
-                sf::FloatRect hitbox(cx+ox-28.f, fy-(float)CELL_H, 56.f, (float)CELL_H);
                 if (hitbox.contains((float)mouse.x,(float)mouse.y)) {
                     int active=gs->active_turn;
                     if (ui_mode==1)      send_ui_event(ACTION_STRIKE,    eid, -1,          active);
