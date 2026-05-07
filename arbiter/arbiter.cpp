@@ -1,47 +1,44 @@
 // ============================================================
 //  arbiter.cpp  —  Game Arbiter (Engine + SFML Arena UI)
 //
-//  ARCHITECTURAL FIXES:
+//  IPC POLICY: POSIX shared memory ONLY — no pipes, no FIFOs.
 //
-//  FLAW 1 — Input Architecture (render thread decoupled from input):
+//  INPUT ARCHITECTURE (render thread is a pure visualizer):
 //
-//    OLD: The SFML render thread wrote directly to gs->pending_action
-//         and gs->action_target for player turns.
+//    The SFML render thread writes UIEvent structs into
+//    gs->ui_events (a UIEventQueue inside shared memory) when
+//    the active player clicks a UI element.  It does NOT
+//    write to gs->pending_action or any action field for
+//    player turns.
 //
-//    NEW: The render thread is now a PURE VISUALIZER.
-//         When a player clicks a UI element, the render thread
-//         writes a UIEvent struct into the named FIFO (HIP_PIPE_PATH)
-//         via send_ui_event().  It does NOT touch pending_action,
-//         action_actor, or any action field for player turns.
+//    HIP player threads poll gs->ui_events for events where
+//    uev.player_idx matches their own index, pop the event
+//    (both operations locked with gs->memory_lock), and push a
+//    PlayerInputEvent into gs->player_buffers[player_idx].
 //
-//         HIP player threads read from the FIFO and push a
-//         PlayerInputEvent into gs->player_buffers[player_idx].
+//    The Arbiter main loop calls pop_player_action() to get the
+//    decision and commits it to gs->pending_action before calling
+//    execute_action() — the same path used for enemy turns.
 //
-//         The Arbiter main loop calls pop_player_action() to obtain
-//         the decision, then commits it to pending_action so that
-//         execute_action() can process it uniformly.
+//  STUN MECHANIC (SIGUSR1 — asynchronous, no flag polling):
 //
-//  FLAW 2 — Stun Mechanic (signal-based, no flag polling):
-//
-//    OLD: trigger_stun() set is_stunned=true and started a timer
-//         thread that cleared it after 3 s.  Threads polled the flag.
-//
-//    NEW: trigger_stun() calls:
-//           pthread_kill(gs->hip_thread_tids[idx], SIGUSR1)  — players
-//           pthread_kill(gs->asp_thread_tids[idx], SIGUSR1)  — enemies
-//         The target thread's stun_handler calls sleep(3) inside the
-//         handler body, blocking that thread for exactly 3 seconds
-//         from the moment of interruption.  No flag is polled.
-//         is_stunned is kept as a VISUAL-ONLY cue for the renderer.
-//         A lightweight clear-thread resets it after 3 s for display.
+//    trigger_stun(idx, is_player) calls:
+//      pthread_kill(gs->hip_thread_tids[idx], SIGUSR1)  — players
+//      pthread_kill(gs->asp_thread_tids[idx], SIGUSR1)  — enemies
+//    The targeted thread's stun_handler calls sleep(3) inside the
+//    signal handler, blocking it for exactly 3 seconds from the
+//    point of interruption.  No code polls is_stunned.
+//    is_stunned is a VISUAL-ONLY flag maintained for the renderer;
+//    a detached clear-thread resets it after 3 s.
 //
 //  OS Concepts:
 //    • POSIX Shared Memory  (shm_open / mmap)
-//    • PTHREAD_PROCESS_SHARED mutex
-//    • Named FIFO           (mkfifo / open / write)
+//    • PTHREAD_PROCESS_SHARED mutex (gs->memory_lock)
+//    • UIEventQueue in shared memory  — NO pipe or FIFO
+//    • PlayerActionBuffer ring-buffer — NO pipe or FIFO
 //    • SIGUSR1 per-thread stun via pthread_kill
-//    • SIGSTOP / SIGCONT: ultimate-ability pause (OS-native)
-//    • SIGALRM: ultimate-ability timer
+//    • SIGSTOP / SIGCONT: ultimate-ability ASP pause (OS-native)
+//    • SIGALRM: ultimate-ability 10-second timer
 //    • pthreads: render thread + deadlock-monitor thread
 // ============================================================
 
@@ -77,9 +74,8 @@ static const int CELL_W      = 128;
 static const int CELL_H      = 128;
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
-static GameState* gs           = nullptr;
-static bool       running      = true;
-static int        hip_pipe_wfd = -1;   // write-end of the HIP FIFO
+static GameState* gs      = nullptr;
+static bool       running = true;
 
 struct AttackTrigger {
     volatile bool fired;
@@ -206,37 +202,26 @@ static void trigger_stun(int entity_idx, bool is_player) {
     pthread_detach(ct);
 }
 
-// ─── FIFO helpers ─────────────────────────────────────────────────────────────
-
-// Creates the FIFO and opens the write end.  Called once from the render thread
-// so that HIP has had time to open the read end (avoiding O_WRONLY hang).
-static int open_hip_pipe_write() {
-    unlink(HIP_PIPE_PATH);
-    if (mkfifo(HIP_PIPE_PATH, 0666) == -1)
-        { perror("Arbiter: mkfifo"); exit(1); }
-
-    // Non-blocking first attempt — succeeds only if HIP already opened read end.
-    int fd = open(HIP_PIPE_PATH, O_WRONLY | O_NONBLOCK);
-    if (fd == -1) {
-        // HIP hasn't opened the read end yet — give it a moment then block.
-        usleep(500000);
-        fd = open(HIP_PIPE_PATH, O_WRONLY);
-    }
-    if (fd == -1) { perror("Arbiter: open pipe write"); exit(1); }
-    return fd;
-}
-
-// Write one UIEvent into the FIFO for HIP to consume.
-// Called from the render thread only.
+// ─── send_ui_event ────────────────────────────────────────────────────────────
+// Called by the Arbiter render thread when the active player clicks a UI
+// element.  Appends a UIEvent to gs->ui_events (shared memory) under
+// gs->memory_lock.  The matching HIP player thread will find and consume it.
+//
+// NO pipe, NO file descriptor, NO write() system call is used here.
+// The event lives entirely inside the shared memory segment.
 static void send_ui_event(int action, int target, int weapon_id, int player_idx) {
-    if (hip_pipe_wfd == -1) return;
     UIEvent ev{ action, target, weapon_id, player_idx };
-    // write() on a pipe is atomic for writes ≤ PIPE_BUF (always true here).
-    write(hip_pipe_wfd, &ev, sizeof(UIEvent));
+    pthread_mutex_lock(&gs->memory_lock);
+    if (gs->ui_events.count < UI_EVENT_CAP)
+        gs->ui_events.events[gs->ui_events.count++] = ev;
+    pthread_mutex_unlock(&gs->memory_lock);
 }
 
-// Pop one resolved action from the per-player ring-buffer.
-// Called from the Arbiter main loop (not the render thread).
+// ─── pop_player_action ────────────────────────────────────────────────────────
+// Called by the Arbiter main loop to obtain a player's resolved decision.
+// HIP player threads pushed the event here after consuming a UIEvent from
+// gs->ui_events (shared memory).  Returns true and fills *out if available.
+// Protected by gs->memory_lock.
 static bool pop_player_action(int player_idx, PlayerInputEvent* out) {
     pthread_mutex_lock(&gs->memory_lock);
     PlayerActionBuffer& buf = gs->player_buffers[player_idx];
@@ -327,6 +312,7 @@ static void init_game() {
     gs->weapon_drop.weapon_id  = WPN_NONE;
     gs->weapon_drop.for_player = -1;
     gs->weapon_drop.decision   = 0;
+        gs->ui_events.count = 0;
 
     // Zero thread-tid arrays; HIP/ASP populate these at thread startup.
     memset(gs->hip_thread_tids, 0, sizeof(gs->hip_thread_tids));
@@ -585,8 +571,6 @@ static void cleanup() {
     pthread_mutex_destroy(&gs->memory_lock);
     munmap(gs, sizeof(GameState));
     shm_unlink(SHARED_MEM_NAME);
-    unlink(HIP_PIPE_PATH);
-    if (hip_pipe_wfd != -1) close(hip_pipe_wfd);
     cout << "Arbiter: cleaned up." << endl;
 }
 
@@ -687,7 +671,7 @@ static bool draw_button(sf::RenderWindow& win, sf::Font& font,
 // ═══════════════════════════════════════════════════════════════════════════════
 //  RENDER THREAD
 //
-//  ROLE: Visualize game state and forward player UI choices to HIP via FIFO.
+//  ROLE: Visualize game state and forward player UI choices via shared memory.
 //
 //  STRICTLY FORBIDDEN: Writing pending_action / action_actor / action_target
 //  for player turns.  All such writes now go through send_ui_event().
@@ -703,10 +687,6 @@ static void* render_thread_func(void*) {
         }
         return nullptr;
     }
-
-    // Open write end of the HIP FIFO (blocks until HIP opens read end).
-    hip_pipe_wfd = open_hip_pipe_write();
-    cout << "Arbiter render: FIFO open." << endl;
 
     sf::RenderWindow win(sf::VideoMode(WIN_W, WIN_H), "Chrono Rift — Arena",
                          sf::Style::Titlebar | sf::Style::Close);
@@ -1150,7 +1130,7 @@ int main() {
 
         if (actor < MAX_PLAYERS) {
             // ── Player turn: pop from PlayerActionBuffer ──────────────────
-            // The render thread sends UIEvents to HIP via the FIFO.
+            // The render thread sends UIEvents to HIP via shared memory.
             // A HIP player thread reads the event and pushes a
             // PlayerInputEvent into player_buffers[actor].
             // We pop it here — the render thread never wrote pending_action.
