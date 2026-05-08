@@ -168,31 +168,23 @@ static void signal_handler(int sig) {
 // clears it after 3 s.
 //
 static void trigger_stun(int entity_idx, bool is_player) {
-    // ── Bounds check BEFORE any array access ──────────────────────────────────
-    // entity_idx must be a valid index into the appropriate tid array.
-    // Silently return if out of range to avoid undefined behaviour.
     if (is_player && (entity_idx < 0 || entity_idx >= MAX_PLAYERS))  return;
     if (!is_player && (entity_idx < 0 || entity_idx >= MAX_ENEMIES)) return;
 
     pthread_mutex_lock(&gs->memory_lock);
-
-    // Set visual-only flag for renderer (stars / "STUNNED" label).
-    // No game-logic code polls this flag to decide whether to act.
     if (is_player && entity_idx < gs->num_players && gs->players[entity_idx].is_alive)
         gs->players[entity_idx].is_stunned = true;
     else if (!is_player && entity_idx < gs->num_enemies && gs->enemies[entity_idx].is_alive)
         gs->enemies[entity_idx].is_stunned = true;
 
-    // Read the registered thread tid (written by HIP/ASP at thread startup;
-    // 0 means the thread has not yet registered or has already exited).
-    pthread_t tid = is_player ? gs->hip_thread_tids[entity_idx]
-                              : gs->asp_thread_tids[entity_idx];
+    // THE FIX: Grab the Process ID (PID) instead of the local Thread ID
+    pid_t target_pid = is_player ? gs->hip_pid : gs->asp_pid;
     pthread_mutex_unlock(&gs->memory_lock);
 
-    // Deliver SIGUSR1 to the specific thread.
-    // The thread's stun_handler calls sleep(3), blocking only that thread.
-    if (tid != 0)
-        pthread_kill(tid, SIGUSR1);
+    // THE FIX: Safely send the signal across processes using POSIX kill()
+    if (target_pid > 0) {
+        kill(target_pid, SIGUSR1);
+    }
 
     // Detached helper clears the visual flag after 3 s.
     struct ClearArg { int idx; bool ip; };
@@ -203,9 +195,9 @@ static void trigger_stun(int entity_idx, bool is_player) {
         ClearArg* a = (ClearArg*)p;
         sleep(3);
         pthread_mutex_lock(&gs->memory_lock);
-        if (a->ip && a->idx < gs->num_players)
+        if (a->ip && a->idx < MAX_PLAYERS)
             gs->players[a->idx].is_stunned = false;
-        else if (!a->ip && a->idx < gs->num_enemies)
+        else if (!a->ip && a->idx < MAX_ENEMIES)
             gs->enemies[a->idx].is_stunned = false;
         pthread_mutex_unlock(&gs->memory_lock);
         delete a;
@@ -431,7 +423,8 @@ static void execute_action() {
 
     Entity& ae = ap ? gs->players[actor] : gs->enemies[actor - MAX_PLAYERS];
     Entity* te_ptr = nullptr;
-    if ((action == ACTION_STRIKE || action == ACTION_EXHAUST || action == ACTION_USE_WEAPON)
+    // Change this line near the top of execute_action():
+    if ((action == ACTION_STRIKE || action == ACTION_EXHAUST || action == ACTION_USE_WEAPON || action == ACTION_HEAL)
         && is_valid_target(target)) {
         te_ptr = tp ? &gs->players[target] : &gs->enemies[target - MAX_PLAYERS];
     }
@@ -464,9 +457,12 @@ static void execute_action() {
             if (te_ptr) {
                 te_ptr->stamina -= ae.damage;
                 if (te_ptr->stamina < 0) te_ptr->stamina = 0;
+                
                 int tidx = tp ? target : (target - MAX_PLAYERS);
                 snprintf(gs->action_log, MAX_ACTION_LOG,
                          "Entity %d EXHAUSTS entity %d — STUNNED!", actor, target);
+                
+                // Unlock memory BEFORE triggering stun to prevent deadlocks
                 pthread_mutex_unlock(&gs->memory_lock);
                 trigger_stun(tidx, tp);
                 pthread_mutex_lock(&gs->memory_lock);
@@ -495,10 +491,14 @@ static void execute_action() {
             break;
 
         case ACTION_HEAL:
-            ae.hp += ae.max_hp / 10;
-            if (ae.hp > ae.max_hp) ae.hp = ae.max_hp;
-            snprintf(gs->action_log, MAX_ACTION_LOG,
-                     "Entity %d HEALS for %d HP", actor, ae.max_hp / 10);
+            if (te_ptr && tp) { // 'tp' ensures the target is actually a Player, not an Enemy!
+                te_ptr->hp += te_ptr->max_hp / 10;
+                if (te_ptr->hp > te_ptr->max_hp) te_ptr->hp = te_ptr->max_hp;
+                snprintf(gs->action_log, MAX_ACTION_LOG,
+                        "Entity %d HEALS Player %d for %d HP", actor, target + 1, te_ptr->max_hp / 10);
+            } else {
+                snprintf(gs->action_log, MAX_ACTION_LOG, "Entity %d missed their heal!", actor);
+            }
             break;
 
         case ACTION_SKIP:
@@ -825,7 +825,6 @@ static void* render_thread_func(void*) {
         };
 
         // Draw players
-        // Draw players
         for (int i=0;i<np;i++) {
             Entity& p = gs->players[i]; 
             sf::Vector2f fp=player_foot(i,np);
@@ -854,6 +853,26 @@ static void* render_thread_func(void*) {
                 else if (tp < 0.8f)  p_frame = 4; // Recover
             }
             // -----------------------------------------------
+
+
+                        // --- NEW TARGETING LOGIC FOR HEALING ---
+            sf::FloatRect p_hitbox(cx+ox-28.f, fy-(float)CELL_H, 56.f, (float)CELL_H);
+            if (p.is_alive && ui_mode == 6) {
+                sf::RectangleShape hb({p_hitbox.width, p_hitbox.height});
+                hb.setPosition(p_hitbox.left, p_hitbox.top);
+                hb.setFillColor({0,0,0,0});
+                hb.setOutlineThickness(2.f);
+                hb.setOutlineColor({255,220,0,200});
+                win.draw(hb);
+            }
+
+            if (p.is_alive && ui_mode == 6 && left_clicked) {
+                if (p_hitbox.contains((float)mouse.x,(float)mouse.y)) {
+                    send_ui_event(ACTION_HEAL, i, -1, gs->active_turn);
+                    ui_mode = 0;
+                }
+            }
+            // ---------------------------------------
 
             if (hasP) draw_flipped(texP, p_frame, cx+ox, fy, true, !p.is_alive, flash[i]);
             else {
@@ -1079,8 +1098,8 @@ static void* render_thread_func(void*) {
             // Row 1
             if (draw_button(win,font,"Strike",  bx,           by,bw,bh,mouse)&&left_clicked&&ui_mode==0) ui_mode=1;
             if (draw_button(win,font,"Exhaust", bx+(bw+gap),  by,bw,bh,mouse)&&left_clicked&&ui_mode==0) ui_mode=2;
-            if (draw_button(win,font,"Heal",    bx+2*(bw+gap),by,bw,bh,mouse)&&left_clicked&&ui_mode==0)
-                { send_ui_event(ACTION_HEAL,  -1, -1, active); ui_mode=0; }
+            if (draw_button(win,font,"Heal", bx+2*(bw+gap),by,bw,bh,mouse)&&left_clicked&&ui_mode==0)
+                    ui_mode = 6;
             if (draw_button(win,font,"Skip",    bx+3*(bw+gap),by,bw,bh,mouse)&&left_clicked&&ui_mode==0)
                 { send_ui_event(ACTION_SKIP,  -1, -1, active); ui_mode=0; }
 
