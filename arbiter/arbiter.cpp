@@ -63,7 +63,7 @@ using namespace std;
 // ─── Window / layout ─────────────────────────────────────────────────────────
 static const int   WIN_W    = 1500;
 static const int   WIN_H    = 720;
-static const float GROUND_Y = WIN_H * 0.72f;
+static const float GROUND_Y = WIN_H * 0.65f;
 static const float P_X1     = 80.f;
 static const float P_X2     = 440.f;
 static const float E_X1     = 760.f;
@@ -78,11 +78,12 @@ static GameState* gs      = nullptr;
 static bool       running = true;
 
 struct AttackTrigger {
-    volatile bool fired;
-    volatile int  attacker;
-    volatile int  target;
+    pthread_mutex_t lock;
+    bool fired;
+    int  attacker;
+    int  target;
 };
-static AttackTrigger atk_trig = {false, 0, 0};
+static AttackTrigger atk_trig = {{}, false, 0, 0};
 static volatile float ultimate_flash_timer = 0.f;
 
 // ─── Forward declarations ─────────────────────────────────────────────────────
@@ -167,22 +168,33 @@ static void signal_handler(int sig) {
 // clears it after 3 s.
 //
 static void trigger_stun(int entity_idx, bool is_player) {
-    // Set visual flag
+    // ── Bounds check BEFORE any array access ──────────────────────────────────
+    // entity_idx must be a valid index into the appropriate tid array.
+    // Silently return if out of range to avoid undefined behaviour.
+    if (is_player && (entity_idx < 0 || entity_idx >= MAX_PLAYERS))  return;
+    if (!is_player && (entity_idx < 0 || entity_idx >= MAX_ENEMIES)) return;
+
     pthread_mutex_lock(&gs->memory_lock);
+
+    // Set visual-only flag for renderer (stars / "STUNNED" label).
+    // No game-logic code polls this flag to decide whether to act.
     if (is_player && entity_idx < gs->num_players && gs->players[entity_idx].is_alive)
         gs->players[entity_idx].is_stunned = true;
     else if (!is_player && entity_idx < gs->num_enemies && gs->enemies[entity_idx].is_alive)
         gs->enemies[entity_idx].is_stunned = true;
 
+    // Read the registered thread tid (written by HIP/ASP at thread startup;
+    // 0 means the thread has not yet registered or has already exited).
     pthread_t tid = is_player ? gs->hip_thread_tids[entity_idx]
                               : gs->asp_thread_tids[entity_idx];
     pthread_mutex_unlock(&gs->memory_lock);
 
-    // Deliver stun signal to the specific thread.
+    // Deliver SIGUSR1 to the specific thread.
+    // The thread's stun_handler calls sleep(3), blocking only that thread.
     if (tid != 0)
         pthread_kill(tid, SIGUSR1);
 
-    // Clear the visual flag after 3 s (detached thread — renderer only).
+    // Detached helper clears the visual flag after 3 s.
     struct ClearArg { int idx; bool ip; };
     ClearArg* ca = new ClearArg{entity_idx, is_player};
 
@@ -251,6 +263,8 @@ static void init_shared_memory() {
     pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
     pthread_mutex_init(&gs->memory_lock, &attr);
     pthread_mutexattr_destroy(&attr);
+    // Init atk_trig mutex (process-local, render thread + game loop)
+    pthread_mutex_init(&atk_trig.lock, nullptr);
 }
 
 static void init_game() {
@@ -275,8 +289,13 @@ static void init_game() {
         p.waiting_for = ART_NONE;
         memset(p.inventory, WPN_NONE, sizeof(p.inventory));
         memset(p.long_term,  WPN_NONE, sizeof(p.long_term));
-        p.inventory[0] = WPN_IRON_HALBERD;
-        p.inventory[1] = WPN_VENOM_DAGGER;
+        // Starter weapons: Iron Halberd fills slots 0-6 (7 slots),
+        // Venom Dagger fills slots 7-10 (4 slots). Contiguous allocation
+        // matches the inventory allocator's own rules exactly.
+        for (int s = 0; s < WPN_SLOTS[WPN_IRON_HALBERD]; s++)
+            p.inventory[s] = WPN_IRON_HALBERD;
+        for (int s = 0; s < WPN_SLOTS[WPN_VENOM_DAGGER]; s++)
+            p.inventory[WPN_SLOTS[WPN_IRON_HALBERD] + s] = WPN_VENOM_DAGGER;
     }
 
     gs->num_enemies = rand() % 8 + 2;
@@ -353,6 +372,10 @@ static void respawn_enemies() {
 }
 
 // ─── Stamina tick ─────────────────────────────────────────────────────────────
+// Called every 1 second from the main loop (usleep(1000000)).
+// Per spec: "each second the entity's speed is added to its current stamina."
+// Speed values (10-30 for enemies, 25-100 for players) fill max_stamina in
+// approximately max_stamina/speed seconds — satisfying the arrival-time logic.
 static void stamina_tick() {
     pthread_mutex_lock(&gs->memory_lock);
     for (int i = 0; i < gs->num_players; i++) {
@@ -413,13 +436,27 @@ static void execute_action() {
         te_ptr = tp ? &gs->players[target] : &gs->enemies[target - MAX_PLAYERS];
     }
 
+    // =========================================================================
+    // THE FIX: Unconditional Stamina Depletion
+    // This perfectly aligns with the project document rules.
+    // =========================================================================
+    if (action == ACTION_SKIP) {
+        ae.stamina = ae.max_stamina / 2; // Skip depletes to 50%
+    } else {
+        ae.stamina = 0; // All other actions deplete to 0 immediately
+    }
+
     switch (action) {
         case ACTION_STRIKE:
             if (te_ptr) {
-                te_ptr->hp -= ae.damage; ae.stamina = 0;
+                te_ptr->hp -= ae.damage; 
                 snprintf(gs->action_log, MAX_ACTION_LOG,
                          "Entity %d STRIKES entity %d for %d dmg", actor, target, ae.damage);
+                pthread_mutex_lock(&atk_trig.lock);
                 atk_trig.attacker = actor; atk_trig.target = target; atk_trig.fired = true;
+                pthread_mutex_unlock(&atk_trig.lock);
+            } else {
+                snprintf(gs->action_log, MAX_ACTION_LOG, "Entity %d missed their strike!", actor);
             }
             break;
 
@@ -427,12 +464,10 @@ static void execute_action() {
             if (te_ptr) {
                 te_ptr->stamina -= ae.damage;
                 if (te_ptr->stamina < 0) te_ptr->stamina = 0;
-                ae.stamina = 0;
                 int tidx = tp ? target : (target - MAX_PLAYERS);
                 snprintf(gs->action_log, MAX_ACTION_LOG,
                          "Entity %d EXHAUSTS entity %d — STUNNED!", actor, target);
                 pthread_mutex_unlock(&gs->memory_lock);
-                // Deliver SIGUSR1 to the specific thread; it does sleep(3) in handler.
                 trigger_stun(tidx, tp);
                 pthread_mutex_lock(&gs->memory_lock);
             }
@@ -440,15 +475,17 @@ static void execute_action() {
 
         case ACTION_USE_WEAPON:
             if (wpn >= 0 && wpn < WPN_COUNT && te_ptr) {
-                te_ptr->hp -= WPN_DAMAGE[wpn]; ae.stamina = 0;
+                te_ptr->hp -= WPN_DAMAGE[wpn]; 
                 snprintf(gs->action_log, MAX_ACTION_LOG,
                          "Entity %d uses %s → %d dmg!", actor, WPN_NAMES[wpn], WPN_DAMAGE[wpn]);
+                pthread_mutex_lock(&atk_trig.lock);
                 atk_trig.attacker = actor; atk_trig.target = target; atk_trig.fired = true;
+                pthread_mutex_unlock(&atk_trig.lock);
             }
             break;
 
         case ACTION_ULTIMATE:
-            ae.stamina = 0; gs->ultimate_pause = true; ultimate_flash_timer = 1.5f;
+            gs->ultimate_pause = true; ultimate_flash_timer = 1.5f;
             if (gs->asp_pid > 0) kill(gs->asp_pid, SIGSTOP);
             alarm(10);
             for (int i = 0; i < gs->num_enemies; i++)
@@ -460,13 +497,11 @@ static void execute_action() {
         case ACTION_HEAL:
             ae.hp += ae.max_hp / 10;
             if (ae.hp > ae.max_hp) ae.hp = ae.max_hp;
-            ae.stamina = 0;
             snprintf(gs->action_log, MAX_ACTION_LOG,
                      "Entity %d HEALS for %d HP", actor, ae.max_hp / 10);
             break;
 
         case ACTION_SKIP:
-            ae.stamina = ae.max_stamina / 2;
             snprintf(gs->action_log, MAX_ACTION_LOG, "Entity %d SKIPS", actor);
             break;
 
@@ -475,7 +510,7 @@ static void execute_action() {
                 int wid = ae.long_term[wpn];
                 pick_up_weapon(ae, wid);
                 for (int k = wpn; k < ae.lt_count - 1; k++) ae.long_term[k] = ae.long_term[k+1];
-                ae.lt_count--; ae.stamina = 0;
+                ae.lt_count--; 
                 snprintf(gs->action_log, MAX_ACTION_LOG,
                          "Entity %d swapped in %s", actor, WPN_NAMES[wid]);
             }
@@ -487,7 +522,7 @@ static void execute_action() {
         te_ptr->is_alive = false; gs->enemies_killed++;
         int eidx = target - MAX_PLAYERS;
         snprintf(gs->action_log, MAX_ACTION_LOG,
-                 "Enemy %d defeated! Kills: %d/10", eidx, gs->enemies_killed);
+                 "Enemy %d defeated! Kills: %d/10", eidx + 1, gs->enemies_killed);
 
         if (gs->enemies_killed == 3 && !gs->eclipse_relic_exists) {
             gs->eclipse_relic_exists = true; gs->eclipse_relic_holder = -1;
@@ -568,7 +603,13 @@ static void* deadlock_monitor_func(void*) {
 }
 
 static void cleanup() {
+    // Notify HIP and ASP to exit cleanly before destroying shared memory.
+    if (gs->hip_pid > 0) kill(gs->hip_pid, SIGTERM);
+    if (gs->asp_pid > 0) kill(gs->asp_pid, SIGTERM);
+    // Give them 1 second to unmap and exit before we destroy the segment.
+    usleep(1000000);
     pthread_mutex_destroy(&gs->memory_lock);
+    pthread_mutex_destroy(&atk_trig.lock);
     munmap(gs, sizeof(GameState));
     shm_unlink(SHARED_MEM_NAME);
     cout << "Arbiter: cleaned up." << endl;
@@ -741,11 +782,13 @@ static void* render_thread_func(void*) {
             { popup_showing=true; popup_weapon_id=gs->weapon_drop.weapon_id; ui_mode=0; }
         if (!gs->weapon_drop.pending) popup_showing=false;
 
-        // Attack lunge animation
+        // Attack lunge animation — lock atk_trig to prevent race with game loop
+        pthread_mutex_lock(&atk_trig.lock);
         if (atk_trig.fired && lng_actor==-1) {
             lng_actor=atk_trig.attacker; lng_target=atk_trig.target;
             lng_timer=0.f; lng_hit=false; atk_trig.fired=false;
         }
+        pthread_mutex_unlock(&atk_trig.lock);
         float lng_ofs=0.f, slash_prog=0.f;
         if (lng_actor!=-1) {
             lng_timer+=dt; float p=lng_timer/LNG_DUR;
@@ -782,13 +825,17 @@ static void* render_thread_func(void*) {
         };
 
         // Draw players
+        // Draw players
         for (int i=0;i<np;i++) {
-            Entity& p=gs->players[i]; sf::Vector2f fp=player_foot(i,np);
+            Entity& p = gs->players[i]; 
+            sf::Vector2f fp=player_foot(i,np);
             float cx=fp.x,fy=fp.y,ox=(lng_actor==i)?lng_ofs:0.f;
             bool is_act=(gs->active_turn==i);
+            
             sf::CircleShape sh(28.f,18); sh.setScale(1.f,0.2f);
             sh.setFillColor({0,0,0,p.is_alive?(sf::Uint8)60:(sf::Uint8)20});
             sh.setOrigin(28.f,28.f); sh.setPosition(cx+ox,fy); win.draw(sh);
+            
             if (is_act&&p.is_alive) {
                 float pulse=0.55f+0.45f*sinf(now*5.f);
                 sf::CircleShape g(48.f,32); g.setFillColor({0,0,0,0});
@@ -796,12 +843,25 @@ static void* render_thread_func(void*) {
                 g.setOutlineColor({255,(sf::Uint8)(220*pulse),0,(sf::Uint8)(210*pulse)});
                 g.setOrigin(48.f,48.f); g.setPosition(cx+ox,fy-48.f); win.draw(g);
             }
-            if (hasP) draw_flipped(texP,i%5,cx+ox,fy,true,!p.is_alive,flash[i]);
+
+            // --- FIX: ANIMATE SPRITE FRAMES DURING LUNGE ---
+            int p_frame = 0; // Default Idle frame
+            if (lng_actor == i) {
+                float tp = lng_timer / LNG_DUR;
+                if      (tp < 0.2f)  p_frame = 1; // Windup
+                else if (tp < 0.4f)  p_frame = 2; // Strike start
+                else if (tp < 0.62f) p_frame = 3; // Strike peak (impact)
+                else if (tp < 0.8f)  p_frame = 4; // Recover
+            }
+            // -----------------------------------------------
+
+            if (hasP) draw_flipped(texP, p_frame, cx+ox, fy, true, !p.is_alive, flash[i]);
             else {
                 sf::RectangleShape r({40.f,70.f});
                 r.setFillColor(p.is_alive?sf::Color{100,160,255}:sf::Color{60,60,60});
                 r.setOrigin(20.f,70.f); r.setPosition(cx+ox,fy); win.draw(r);
             }
+            
             if (p.is_stunned&&p.is_alive) {
                 for (int s=0;s<3;s++) {
                     float ang=(float)s/3.f*6.2832f+now*3.f;
@@ -819,12 +879,15 @@ static void* render_thread_func(void*) {
 
         // Draw enemies
         for (int i=0;i<ne;i++) {
-            Entity& e=gs->enemies[i]; sf::Vector2f fp=enemy_foot(i,ne);
+            Entity& e = gs->enemies[i]; 
+            sf::Vector2f fp=enemy_foot(i,ne);
             float cx=fp.x,fy=fp.y; int eid=MAX_PLAYERS+i;
             bool is_act=(gs->active_turn==eid); float ox=(lng_actor==eid)?-lng_ofs:0.f;
+            
             sf::CircleShape sh(28.f,18); sh.setScale(1.f,0.2f);
             sh.setFillColor({0,0,0,e.is_alive?(sf::Uint8)60:(sf::Uint8)20});
             sh.setOrigin(28.f,28.f); sh.setPosition(cx+ox,fy); win.draw(sh);
+            
             if (is_act&&e.is_alive) {
                 float pulse=0.55f+0.45f*sinf(now*5.f);
                 sf::CircleShape g(48.f,32); g.setFillColor({0,0,0,0});
@@ -832,16 +895,30 @@ static void* render_thread_func(void*) {
                 g.setOutlineColor({255,(sf::Uint8)(80*pulse),80,(sf::Uint8)(210*pulse)});
                 g.setOrigin(48.f,48.f); g.setPosition(cx+ox,fy-48.f); win.draw(g);
             }
+            
             sf::Texture* et=nullptr;
             if      (i%3==0&&hasS) et=&texS;
             else if (i%3==1&&hasR) et=&texR;
             else if (hasB)         et=&texB;
-            if (et) draw_flipped(*et,0,cx+ox,fy,true,!e.is_alive,flash[eid]);
+            
+            // --- FIX: ANIMATE SPRITE FRAMES DURING LUNGE ---
+            int e_frame = 0; // Default Idle frame
+            if (lng_actor == eid) {
+                float tp = lng_timer / LNG_DUR;
+                if      (tp < 0.2f)  e_frame = 1; // Windup
+                else if (tp < 0.4f)  e_frame = 2; // Strike start
+                else if (tp < 0.62f) e_frame = 3; // Strike peak (impact)
+                else if (tp < 0.8f)  e_frame = 4; // Recover
+            }
+            // -----------------------------------------------
+
+            if (et) draw_flipped(*et, e_frame, cx+ox, fy, true, !e.is_alive, flash[eid]);
             else {
                 sf::RectangleShape r({40.f,60.f});
                 r.setFillColor(e.is_alive?sf::Color{220,80,80}:sf::Color{60,60,60});
                 r.setOrigin(20.f,60.f); r.setPosition(cx+ox,fy); win.draw(r);
             }
+            
             if (e.is_stunned&&e.is_alive) {
                 for (int s=0;s<3;s++) {
                     float ang=(float)s/3.f*6.2832f+now*3.f;
@@ -850,7 +927,7 @@ static void* render_thread_func(void*) {
                     star.setPosition(cx+ox+cosf(ang)*22.f,fy-CELL_H+sinf(ang)*8.f); win.draw(star);
                 }
             }
-            // Enemy hitbox for targeting (strike/exhaust/use-weapon)
+            
             sf::FloatRect hitbox(cx+ox-28.f, fy-(float)CELL_H, 56.f, (float)CELL_H);
             if (e.is_alive && (ui_mode==1||ui_mode==2||ui_mode==5)) {
                 sf::RectangleShape hb({hitbox.width, hitbox.height});
@@ -861,10 +938,9 @@ static void* render_thread_func(void*) {
                 win.draw(hb);
             }
 
-            // Enemy click for targeting (strike/exhaust/use-weapon)
             if (e.is_alive && (ui_mode==1||ui_mode==2||ui_mode==5) && left_clicked) {
                 if (hitbox.contains((float)mouse.x,(float)mouse.y)) {
-                    int active=gs->active_turn;
+                    int active = gs->active_turn;
                     if (ui_mode==1)      send_ui_event(ACTION_STRIKE,    eid, -1,          active);
                     else if (ui_mode==2) send_ui_event(ACTION_EXHAUST,   eid, -1,          active);
                     else                 send_ui_event(ACTION_USE_WEAPON, eid, ui_weapon_sel, active);
@@ -960,11 +1036,15 @@ static void* render_thread_func(void*) {
                     pthread_mutex_unlock(&gs->memory_lock); popup_showing=false;
                 } else if (leave_hov) {
                     pthread_mutex_lock(&gs->memory_lock);
+                    // Per spec: if the player does not pick up the weapon,
+                    // an enemy is GUARANTEED to pick it up.
                     for (int i=0;i<gs->num_enemies;i++) {
                         if (gs->enemies[i].is_alive) {
                             pick_up_weapon(gs->enemies[i],wpn_id);
-                            snprintf(gs->action_log,MAX_ACTION_LOG,"Enemy %d picked up %s!",
-                                     i+1,wpn_id>=0&&wpn_id<WPN_COUNT?WPN_NAMES[wpn_id]:"?");
+                            snprintf(gs->action_log,MAX_ACTION_LOG,
+                                     "Enemy %d picked up %s!",
+                                     i+1,
+                                     (wpn_id>=0&&wpn_id<WPN_COUNT)?WPN_NAMES[wpn_id]:"?");
                             break;
                         }
                     }
@@ -1122,7 +1202,7 @@ int main() {
             usleep(50000);
 
         stamina_tick();
-        usleep(100000);
+        usleep(1000000);   // 1 second per tick — spec says "each second speed is added"
 
         int actor = find_next_actor();
         if (actor == -1) continue;
@@ -1170,7 +1250,7 @@ int main() {
                     gs->pending_action = ACTION_SKIP;
                     gs->action_actor   = actor;
                     snprintf(gs->action_log, MAX_ACTION_LOG,
-                             "Enemy %d timed out — auto SKIP", actor - MAX_PLAYERS);
+                             "Enemy %d timed out — auto SKIP", actor - MAX_PLAYERS + 1);
                     break;
                 }
             }
