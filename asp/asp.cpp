@@ -1,31 +1,3 @@
-// ============================================================
-//  asp.cpp  —  Automated Strategic Process (AI)
-//
-//  ARCHITECTURAL FIX — Flaw 2 (Stun Mechanic):
-//
-//    OLD: Arbiter set is_stunned=true; enemy threads polled the
-//         flag before each action with:  if (e.is_stunned) skip;
-//
-//    NEW:
-//      • Each enemy thread registers its pthread_t in
-//        gs->asp_thread_tids[enemy_idx] at startup.
-//      • When an enemy is stunned, the Arbiter calls:
-//            pthread_kill(gs->asp_thread_tids[i], SIGUSR1)
-//        This delivers SIGUSR1 to that specific thread only.
-//      • The per-thread stun_handler calls sleep(3) INSIDE the
-//        handler body, halting the thread for exactly 3 seconds
-//        from the point of interruption, then resuming normally.
-//      • No game logic code polls is_stunned.  The interruption
-//        is asynchronous and non-blocking for all other threads.
-//
-//  OS Concepts demonstrated:
-//    • POSIX Shared Memory  (shm_open / mmap)
-//    • pthreads: one dedicated thread per enemy NPC
-//    • SIGSTOP / SIGCONT: ultimate-ability full-pause (OS-native)
-//    • SIGUSR1 per-thread stun via pthread_kill + sleep(3) in handler
-//    • PTHREAD_PROCESS_SHARED mutex for shared state access
-// ============================================================
-
 #include <iostream>
 #include <cstring>
 #include <cstdlib>
@@ -40,32 +12,14 @@
 
 using namespace std;
 
-// ─── Globals ──────────────────────────────────────────────────────────────────
+// Globals 
 static GameState* gs      = nullptr;
 static bool       running = true;
 
-// ─── Per-thread stun signal handler ──────────────────────────────────────────
-//
-// DESIGN RATIONALE (satisfies Flaw 2 requirement):
-//
-//   The Arbiter delivers SIGUSR1 to a specific enemy thread via:
-//       pthread_kill(gs->asp_thread_tids[enemy_idx], SIGUSR1)
-//
-//   Calling sleep(3) here suspends ONLY the targeted thread for
-//   3 seconds from the exact moment of signal delivery.  All other
-//   enemy threads (and the main ASP thread) continue running.
-//
-//   After sleep(3) returns, this thread resumes from the point of
-//   interruption.  Typically it was either:
-//     (a) Waiting in the usleep(50000) spin for active_turn, or
-//     (b) Waiting in the usleep(20000) spin for pending_action.
-//   Both loops simply retry after the handler returns — the Arbiter's
-//   turn-timeout will have advanced active_turn, so the thread finds
-//   it is no longer this enemy's turn and idles until next time.
-//
+
 static void stun_handler(int sig) {
     (void)sig;
-    sleep(3);  // halt this thread — and only this thread — for 3 seconds
+    sleep(3); 
 }
 
 static void sigterm_handler(int sig) {
@@ -76,8 +30,8 @@ static void sigterm_handler(int sig) {
 // SIGSTOP / SIGCONT for the ultimate ability are delivered to the
 // entire ASP process and handled automatically by the OS.
 
-// ─── Enemy AI decision ────────────────────────────────────────────────────────
-// Simple AI: strike the first alive player with 80% probability, else skip.
+// Enemy AI decision
+// strike the first alive player with 80% probability, else skip.
 static void enemy_decide(int enemy_idx) {
     int target = -1;
     for (int i = 0; i < gs->num_players; i++)
@@ -98,17 +52,17 @@ static void enemy_decide(int enemy_idx) {
     }
 }
 
-// ─── Enemy thread ─────────────────────────────────────────────────────────────
+// Enemy thread
 struct EnemyThreadArg { int enemy_index; };
 
 static void* enemy_thread_func(void* arg) {
     EnemyThreadArg* earg = (EnemyThreadArg*)arg;
     const int idx = earg->enemy_index;
 
-    // ── 1. Register this thread's tid for targeted stun signals ───────────
+    //Register this thread's tid for targeted stun signals
     gs->asp_thread_tids[idx] = pthread_self();
 
-    // ── 2. Unblock SIGUSR1 in this thread only ─────────────────────────────
+    // Unblock SIGUSR1 in this thread only 
     // main() blocks SIGUSR1 process-wide.  Each enemy thread unblocks it
     // for itself so only the correct thread receives the stun signal.
     sigset_t unblock;
@@ -126,15 +80,7 @@ static void* enemy_thread_func(void* arg) {
         int my_turn = MAX_PLAYERS + idx;
         if (gs->active_turn != my_turn) { usleep(50000); continue; }
 
-        // ── Decide and post action ─────────────────────────────────────────
-        //
-        // If SIGUSR1 arrives here, stun_handler fires immediately and
-        // sleep(3) runs.  After 3 s the handler returns, execution
-        // resumes, and the next loop iteration finds that active_turn
-        // has advanced (Arbiter timeout), so the thread idles cleanly.
-        //
-        // There is NO is_stunned poll here — the stun is fully asynchronous.
-        //
+        // Decide and post action 
         pthread_mutex_lock(&gs->memory_lock);
         enemy_decide(idx);
         pthread_mutex_unlock(&gs->memory_lock);
@@ -147,7 +93,7 @@ static void* enemy_thread_func(void* arg) {
     return nullptr;
 }
 
-// ─── Attach to shared memory ──────────────────────────────────────────────────
+// Attach to shared memory 
 static void attach_shared_memory() {
     int fd = -1;
     for (int i = 0; i < 10 && fd == -1; i++) {
@@ -162,16 +108,14 @@ static void attach_shared_memory() {
     close(fd);
 }
 
-// ─── main ─────────────────────────────────────────────────────────────────────
+// main 
 int main() {
-    // ── Block SIGUSR1 process-wide; threads unblock it individually ────────
+    //Block SIGUSR1 process-wide; threads unblock it individually 
     sigset_t block_usr1;
     sigemptyset(&block_usr1);
     sigaddset(&block_usr1, SIGUSR1);
     pthread_sigmask(SIG_BLOCK, &block_usr1, nullptr);
 
-    // Install the stun handler.  SA_RESTART is omitted so that any blocking
-    // syscall (usleep is not blocking, but for correctness) returns EINTR.
     struct sigaction sa{};
     sa.sa_handler = stun_handler;
     sigemptyset(&sa.sa_mask);
@@ -179,7 +123,6 @@ int main() {
     sigaction(SIGUSR1, &sa, nullptr);
 
     signal(SIGTERM, sigterm_handler);
-    // SIGSTOP / SIGCONT for ultimate ability are handled by the OS.
 
     cout << "ASP: Connecting to shared memory..." << endl;
     attach_shared_memory();
@@ -187,7 +130,7 @@ int main() {
     gs->asp_pid = getpid();
     srand(ROLL_SEED + 1);
 
-    // Zero out thread-tid array — Arbiter checks for 0 before pthread_kill.
+    // Zero out thread-tid array, Arbiter checks for 0 before pthread_kill.
     memset(gs->asp_thread_tids, 0, sizeof(gs->asp_thread_tids));
 
     cout << "ASP: Connected.  Enemies = " << gs->num_enemies << endl;

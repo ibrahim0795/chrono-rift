@@ -1,47 +1,3 @@
-// ============================================================
-//  arbiter.cpp  —  Game Arbiter (Engine + SFML Arena UI)
-//
-//  IPC POLICY: POSIX shared memory ONLY — no pipes, no FIFOs.
-//
-//  INPUT ARCHITECTURE (render thread is a pure visualizer):
-//
-//    The SFML render thread writes UIEvent structs into
-//    gs->ui_events (a UIEventQueue inside shared memory) when
-//    the active player clicks a UI element.  It does NOT
-//    write to gs->pending_action or any action field for
-//    player turns.
-//
-//    HIP player threads poll gs->ui_events for events where
-//    uev.player_idx matches their own index, pop the event
-//    (both operations locked with gs->memory_lock), and push a
-//    PlayerInputEvent into gs->player_buffers[player_idx].
-//
-//    The Arbiter main loop calls pop_player_action() to get the
-//    decision and commits it to gs->pending_action before calling
-//    execute_action() — the same path used for enemy turns.
-//
-//  STUN MECHANIC (SIGUSR1 — asynchronous, no flag polling):
-//
-//    trigger_stun(idx, is_player) calls:
-//      pthread_kill(gs->hip_thread_tids[idx], SIGUSR1)  — players
-//      pthread_kill(gs->asp_thread_tids[idx], SIGUSR1)  — enemies
-//    The targeted thread's stun_handler calls sleep(3) inside the
-//    signal handler, blocking it for exactly 3 seconds from the
-//    point of interruption.  No code polls is_stunned.
-//    is_stunned is a VISUAL-ONLY flag maintained for the renderer;
-//    a detached clear-thread resets it after 3 s.
-//
-//  OS Concepts:
-//    • POSIX Shared Memory  (shm_open / mmap)
-//    • PTHREAD_PROCESS_SHARED mutex (gs->memory_lock)
-//    • UIEventQueue in shared memory  — NO pipe or FIFO
-//    • PlayerActionBuffer ring-buffer — NO pipe or FIFO
-//    • SIGUSR1 per-thread stun via pthread_kill
-//    • SIGSTOP / SIGCONT: ultimate-ability ASP pause (OS-native)
-//    • SIGALRM: ultimate-ability 10-second timer
-//    • pthreads: render thread + deadlock-monitor thread
-// ============================================================
-
 #include <iostream>
 #include <cstring>
 #include <cstdlib>
@@ -60,7 +16,7 @@
 
 using namespace std;
 
-// ─── Window / layout ─────────────────────────────────────────────────────────
+//Window / layout
 static const int   WIN_W    = 1500;
 static const int   WIN_H    = 720;
 static const float GROUND_Y = WIN_H * 0.65f;
@@ -69,11 +25,11 @@ static const float P_X2     = 440.f;
 static const float E_X1     = 760.f;
 static const float E_X2     = 1220.f;
 
-// ─── Sprite sheet constants ───────────────────────────────────────────────────
+// Sprite sheet constants 
 static const int CELL_W      = 128;
 static const int CELL_H      = 128;
 
-// ─── Globals ──────────────────────────────────────────────────────────────────
+// Globals
 static GameState* gs      = nullptr;
 static bool       running = true;
 
@@ -86,7 +42,7 @@ struct AttackTrigger {
 static AttackTrigger atk_trig = {{}, false, 0, 0};
 static volatile float ultimate_flash_timer = 0.f;
 
-// ─── Forward declarations ─────────────────────────────────────────────────────
+// Forward declarations 
 static void  init_game();
 static void  stamina_tick();
 static int   find_next_actor();
@@ -101,7 +57,7 @@ static void  trigger_stun(int entity_idx, bool is_player);
 static void  send_ui_event(int action, int target, int weapon_id, int player_idx);
 static bool  pop_player_action(int player_idx, PlayerInputEvent* out);
 
-// ─── Inventory helpers (unchanged) ───────────────────────────────────────────
+// Inventory helpers 
 static int find_contiguous_slots(Entity& e, int size) {
     for (int i = 0; i <= INVENTORY_SIZE - size; i++) {
         bool ok = true;
@@ -144,7 +100,7 @@ static bool entity_has_weapon(Entity& e, int wpn_id) {
     return false;
 }
 
-// ─── Process signals ──────────────────────────────────────────────────────────
+// Process signals
 static void signal_handler(int sig) {
     if (sig == SIGTERM) { gs->is_game_over = true; running = false; }
     if (sig == SIGCHLD) { int s; waitpid(-1, &s, WNOHANG); }
@@ -155,18 +111,6 @@ static void signal_handler(int sig) {
     }
 }
 
-// ─── Stun: deliver SIGUSR1 to the specific owning thread ─────────────────────
-//
-// For players: gs->hip_thread_tids[entity_idx] was registered by the HIP
-//              player thread for that player at startup.
-// For enemies: gs->asp_thread_tids[entity_idx] was registered by the ASP
-//              enemy thread for that enemy at startup.
-//
-// pthread_kill() targets exactly one thread in the owning process.
-// The thread's stun_handler calls sleep(3), blocking it for 3 s.
-// is_stunned is set here only for the renderer; a detached helper
-// clears it after 3 s.
-//
 static void trigger_stun(int entity_idx, bool is_player) {
     if (is_player && (entity_idx < 0 || entity_idx >= MAX_PLAYERS))  return;
     if (!is_player && (entity_idx < 0 || entity_idx >= MAX_ENEMIES)) return;
@@ -177,11 +121,11 @@ static void trigger_stun(int entity_idx, bool is_player) {
     else if (!is_player && entity_idx < gs->num_enemies && gs->enemies[entity_idx].is_alive)
         gs->enemies[entity_idx].is_stunned = true;
 
-    // THE FIX: Grab the Process ID (PID) instead of the local Thread ID
+    // Grab the Process ID instead of the local Thread ID
     pid_t target_pid = is_player ? gs->hip_pid : gs->asp_pid;
     pthread_mutex_unlock(&gs->memory_lock);
 
-    // THE FIX: Safely send the signal across processes using POSIX kill()
+    // Safely send the signal across processes using POSIX kill()
     if (target_pid > 0) {
         kill(target_pid, SIGUSR1);
     }
@@ -206,13 +150,6 @@ static void trigger_stun(int entity_idx, bool is_player) {
     pthread_detach(ct);
 }
 
-// ─── send_ui_event ────────────────────────────────────────────────────────────
-// Called by the Arbiter render thread when the active player clicks a UI
-// element.  Appends a UIEvent to gs->ui_events (shared memory) under
-// gs->memory_lock.  The matching HIP player thread will find and consume it.
-//
-// NO pipe, NO file descriptor, NO write() system call is used here.
-// The event lives entirely inside the shared memory segment.
 static void send_ui_event(int action, int target, int weapon_id, int player_idx) {
     UIEvent ev{ action, target, weapon_id, player_idx };
     pthread_mutex_lock(&gs->memory_lock);
@@ -221,11 +158,6 @@ static void send_ui_event(int action, int target, int weapon_id, int player_idx)
     pthread_mutex_unlock(&gs->memory_lock);
 }
 
-// ─── pop_player_action ────────────────────────────────────────────────────────
-// Called by the Arbiter main loop to obtain a player's resolved decision.
-// HIP player threads pushed the event here after consuming a UIEvent from
-// gs->ui_events (shared memory).  Returns true and fills *out if available.
-// Protected by gs->memory_lock.
 static bool pop_player_action(int player_idx, PlayerInputEvent* out) {
     pthread_mutex_lock(&gs->memory_lock);
     PlayerActionBuffer& buf = gs->player_buffers[player_idx];
@@ -239,7 +171,7 @@ static bool pop_player_action(int player_idx, PlayerInputEvent* out) {
     return has;
 }
 
-// ─── Shared memory + game init ────────────────────────────────────────────────
+// Shared memory + game init
 static void init_shared_memory() {
     int fd = shm_open(SHARED_MEM_NAME, O_CREAT | O_RDWR, 0666);
     if (fd == -1) { perror("shm_open"); exit(1); }
@@ -281,9 +213,7 @@ static void init_game() {
         p.waiting_for = ART_NONE;
         memset(p.inventory, WPN_NONE, sizeof(p.inventory));
         memset(p.long_term,  WPN_NONE, sizeof(p.long_term));
-        // Starter weapons: Iron Halberd fills slots 0-6 (7 slots),
-        // Venom Dagger fills slots 7-10 (4 slots). Contiguous allocation
-        // matches the inventory allocator's own rules exactly.
+
         for (int s = 0; s < WPN_SLOTS[WPN_IRON_HALBERD]; s++)
             p.inventory[s] = WPN_IRON_HALBERD;
         for (int s = 0; s < WPN_SLOTS[WPN_VENOM_DAGGER]; s++)
@@ -344,7 +274,7 @@ static void init_game() {
          << "  Enemies:" << gs->num_enemies << endl;
 }
 
-// ─── Respawn enemies ──────────────────────────────────────────────────────────
+// Respawn enemies
 static void respawn_enemies() {
     int count = rand() % 3 + 2;
     if (count > MAX_ENEMIES) count = MAX_ENEMIES;
@@ -363,11 +293,6 @@ static void respawn_enemies() {
              "New wave! %d enemies approach...", count);
 }
 
-// ─── Stamina tick ─────────────────────────────────────────────────────────────
-// Called every 1 second from the main loop (usleep(1000000)).
-// Per spec: "each second the entity's speed is added to its current stamina."
-// Speed values (10-30 for enemies, 25-100 for players) fill max_stamina in
-// approximately max_stamina/speed seconds — satisfying the arrival-time logic.
 static void stamina_tick() {
     pthread_mutex_lock(&gs->memory_lock);
     for (int i = 0; i < gs->num_players; i++) {
@@ -387,7 +312,7 @@ static void stamina_tick() {
     pthread_mutex_unlock(&gs->memory_lock);
 }
 
-// ─── Find next actor ──────────────────────────────────────────────────────────
+// Find next actor
 static int find_next_actor() {
     int best = -1, best_sta = -1;
     for (int i = 0; i < gs->num_players; i++) {
@@ -403,7 +328,7 @@ static int find_next_actor() {
     return best;
 }
 
-// ─── Execute action ───────────────────────────────────────────────────────────
+// Execute action 
 static void execute_action() {
     if (gs->pending_action == ACTION_NONE) return;
     pthread_mutex_lock(&gs->memory_lock);
@@ -423,16 +348,11 @@ static void execute_action() {
 
     Entity& ae = ap ? gs->players[actor] : gs->enemies[actor - MAX_PLAYERS];
     Entity* te_ptr = nullptr;
-    // Change this line near the top of execute_action():
     if ((action == ACTION_STRIKE || action == ACTION_EXHAUST || action == ACTION_USE_WEAPON || action == ACTION_HEAL)
         && is_valid_target(target)) {
         te_ptr = tp ? &gs->players[target] : &gs->enemies[target - MAX_PLAYERS];
     }
 
-    // =========================================================================
-    // THE FIX: Unconditional Stamina Depletion
-    // This perfectly aligns with the project document rules.
-    // =========================================================================
     if (action == ACTION_SKIP) {
         ae.stamina = ae.max_stamina / 2; // Skip depletes to 50%
     } else {
@@ -556,7 +476,7 @@ static void execute_action() {
     pthread_mutex_unlock(&gs->memory_lock);
 }
 
-// ─── Check win/loss + respawn ─────────────────────────────────────────────────
+// Check win/loss + respawn 
 static void check_win_loss() {
     if (gs->enemies_killed >= 10) { gs->is_game_over = true; gs->player_won = true; return; }
     bool any_e = false;
@@ -567,7 +487,7 @@ static void check_win_loss() {
     if (!any_p) { gs->is_game_over = true; gs->player_won = false; }
 }
 
-// ─── Deadlock monitor ────────────────────────────────────────────────────────
+// Deadlock monitor
 static void* deadlock_monitor_func(void*) {
     while (!gs->is_game_over) {
         sleep(2);
@@ -614,10 +534,6 @@ static void cleanup() {
     shm_unlink(SHARED_MEM_NAME);
     cout << "Arbiter: cleaned up." << endl;
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Render helpers (unchanged from original)
-// ═══════════════════════════════════════════════════════════════════════════════
 
 static sf::Vector2f player_foot(int i, int n) {
     float x = (n <= 1) ? (P_X1+P_X2)/2.f : P_X1+(P_X2-P_X1)*((float)i/(n-1));
@@ -709,14 +625,6 @@ static bool draw_button(sf::RenderWindow& win, sf::Font& font,
     return hovered;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  RENDER THREAD
-//
-//  ROLE: Visualize game state and forward player UI choices via shared memory.
-//
-//  STRICTLY FORBIDDEN: Writing pending_action / action_actor / action_target
-//  for player turns.  All such writes now go through send_ui_event().
-// ═══════════════════════════════════════════════════════════════════════════════
 static void* render_thread_func(void*) {
     const char* disp = getenv("DISPLAY");
     if (!disp || !disp[0]) {
@@ -782,7 +690,7 @@ static void* render_thread_func(void*) {
             { popup_showing=true; popup_weapon_id=gs->weapon_drop.weapon_id; ui_mode=0; }
         if (!gs->weapon_drop.pending) popup_showing=false;
 
-        // Attack lunge animation — lock atk_trig to prevent race with game loop
+        // Attack lunge animation, lock atk_trig to prevent race with game loop
         pthread_mutex_lock(&atk_trig.lock);
         if (atk_trig.fired && lng_actor==-1) {
             lng_actor=atk_trig.attacker; lng_target=atk_trig.target;
@@ -843,7 +751,7 @@ static void* render_thread_func(void*) {
                 g.setOrigin(48.f,48.f); g.setPosition(cx+ox,fy-48.f); win.draw(g);
             }
 
-            // --- FIX: ANIMATE SPRITE FRAMES DURING LUNGE ---
+            // ANIMATE SPRITE FRAMES DURING LUNGE
             int p_frame = 0; // Default Idle frame
             if (lng_actor == i) {
                 float tp = lng_timer / LNG_DUR;
@@ -852,10 +760,9 @@ static void* render_thread_func(void*) {
                 else if (tp < 0.62f) p_frame = 3; // Strike peak (impact)
                 else if (tp < 0.8f)  p_frame = 4; // Recover
             }
-            // -----------------------------------------------
 
 
-                        // --- NEW TARGETING LOGIC FOR HEALING ---
+                        // NEW TARGETING LOGIC FOR HEALING
             sf::FloatRect p_hitbox(cx+ox-28.f, fy-(float)CELL_H, 56.f, (float)CELL_H);
             if (p.is_alive && ui_mode == 6) {
                 sf::RectangleShape hb({p_hitbox.width, p_hitbox.height});
@@ -872,7 +779,7 @@ static void* render_thread_func(void*) {
                     ui_mode = 0;
                 }
             }
-            // ---------------------------------------
+
 
             if (hasP) draw_flipped(texP, p_frame, cx+ox, fy, true, !p.is_alive, flash[i]);
             else {
@@ -920,7 +827,7 @@ static void* render_thread_func(void*) {
             else if (i%3==1&&hasR) et=&texR;
             else if (hasB)         et=&texB;
             
-            // --- FIX: ANIMATE SPRITE FRAMES DURING LUNGE ---
+            // ANIMATE SPRITE FRAMES DURING LUNGE 
             int e_frame = 0; // Default Idle frame
             if (lng_actor == eid) {
                 float tp = lng_timer / LNG_DUR;
@@ -929,7 +836,6 @@ static void* render_thread_func(void*) {
                 else if (tp < 0.62f) e_frame = 3; // Strike peak (impact)
                 else if (tp < 0.8f)  e_frame = 4; // Recover
             }
-            // -----------------------------------------------
 
             if (et) draw_flipped(*et, e_frame, cx+ox, fy, true, !e.is_alive, flash[eid]);
             else {
@@ -1074,9 +980,7 @@ static void* render_thread_func(void*) {
         }
 
         // PLAYER ACTION PANEL
-        // KEY CHANGE: every button now calls send_ui_event() instead of
-        // writing gs->pending_action directly.  The render thread is a
-        // pure visualizer; HIP owns all player-side action writing.
+
         int active=gs->active_turn;
         bool is_player_turn=(active>=0&&active<MAX_PLAYERS&&!popup_showing);
         if (is_player_turn) {
@@ -1161,7 +1065,7 @@ static void* render_thread_func(void*) {
                     sf::FloatRect hitbox(slx,sly,slot_s,slot_s);
                     if (hitbox.contains((float)mouse.x,(float)mouse.y)) {
                         hl=true;
-                        // k is the long-term slot index — weapon_id carries it
+                        // k is the long-term slot index, weapon_id carries it
                         if (left_clicked) { send_ui_event(ACTION_SWAP_IN,-1,k,active); ui_mode=0; }
                     }
                     draw_weapon_icon(win,font,wid,slx,sly,slot_s,hl);
@@ -1199,7 +1103,7 @@ static void* render_thread_func(void*) {
     return nullptr;
 }
 
-// ─── main ─────────────────────────────────────────────────────────────────────
+//main
 int main() {
     signal(SIGTERM, signal_handler);
     signal(SIGCHLD, signal_handler);
@@ -1221,18 +1125,14 @@ int main() {
             usleep(50000);
 
         stamina_tick();
-        usleep(1000000);   // 1 second per tick — spec says "each second speed is added"
+        usleep(1000000);   // 1 second per tick, spec says "each second speed is added"
 
         int actor = find_next_actor();
         if (actor == -1) continue;
         gs->active_turn = actor;
 
         if (actor < MAX_PLAYERS) {
-            // ── Player turn: pop from PlayerActionBuffer ──────────────────
-            // The render thread sends UIEvents to HIP via shared memory.
-            // A HIP player thread reads the event and pushes a
-            // PlayerInputEvent into player_buffers[actor].
-            // We pop it here — the render thread never wrote pending_action.
+        
             PlayerInputEvent pie{}; pie.valid = false;
             int timeout = 0;
 
@@ -1240,7 +1140,6 @@ int main() {
                 if (pop_player_action(actor, &pie)) break;
                 usleep(50000);
                 if (++timeout > 200) {
-                    // 10-second safety timeout: auto-skip
                     pie = {ACTION_SKIP, -1, -1, true};
                     snprintf(gs->action_log, MAX_ACTION_LOG,
                              "Player %d timed out — auto SKIP", actor + 1);
@@ -1261,7 +1160,7 @@ int main() {
             pthread_mutex_unlock(&gs->memory_lock);
 
         } else {
-            // ── Enemy turn: wait for ASP thread to post action ────────────
+            // Enemy turn: wait for ASP thread to post action
             int timeout = 0;
             while (gs->pending_action == ACTION_NONE && !gs->is_game_over) {
                 usleep(50000);
