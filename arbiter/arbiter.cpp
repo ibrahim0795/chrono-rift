@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <SFML/Graphics.hpp>
 #include "../common.h"
+#include "../shared/shared_utils.h"
 
 using namespace std;
 
@@ -56,6 +57,25 @@ static void  cleanup();
 static void  trigger_stun(int entity_idx, bool is_player);
 static void  send_ui_event(int action, int target, int weapon_id, int player_idx);
 static bool  pop_player_action(int player_idx, PlayerInputEvent* out);
+
+// Attack-trigger helper (render thread reads this to animate lunges)
+static void fire_attack_trigger(int attacker, int target) {
+    pthread_mutex_lock(&atk_trig.lock);
+    atk_trig.attacker = attacker;
+    atk_trig.target   = target;
+    atk_trig.fired    = true;
+    pthread_mutex_unlock(&atk_trig.lock);
+}
+
+// Lunge animation frame from normalised progress
+static int compute_lunge_frame(float timer, float duration) {
+    float tp = timer / duration;
+    if      (tp < 0.2f)  return 1;
+    else if (tp < 0.4f)  return 2;
+    else if (tp < 0.62f) return 3;
+    else if (tp < 0.8f)  return 4;
+    return 0;
+}
 
 // Inventory helpers 
 static int find_contiguous_slots(Entity& e, int size) {
@@ -248,21 +268,8 @@ static void init_game() {
     }
 
     gs->num_enemies = rand() % 8 + 2;
-    for (int i = 0; i < gs->num_enemies; i++) {
-        Entity& e     = gs->enemies[i];
-        e.is_alive    = true;
-        e.is_stunned  = false;
-        e.hp          = LAST_TWO + (rand() % 151 + 50);
-        e.max_hp      = e.hp;
-        e.max_stamina = 150;
-        e.stamina     = 0;
-        e.damage      = SECOND_LAST + 10;
-        e.speed       = rand() % 21 + 10;
-        e.lt_count    = 0;
-        e.waiting_for = ART_NONE;
-        memset(e.inventory, WPN_NONE, sizeof(e.inventory));
-        memset(e.long_term,  WPN_NONE, sizeof(e.long_term));
-    }
+    for (int i = 0; i < gs->num_enemies; i++)
+        init_enemy(gs->enemies[i]);
 
     gs->is_game_over  = false;
     gs->player_won    = false;
@@ -306,16 +313,8 @@ static void respawn_enemies() {
     int count = rand() % 3 + 2;
     if (count > MAX_ENEMIES) count = MAX_ENEMIES;
     gs->num_enemies = count;
-    for (int i = 0; i < count; i++) {
-        Entity& e = gs->enemies[i];
-        e.is_alive = true; e.is_stunned = false;
-        e.hp = LAST_TWO + (rand() % 151 + 50); e.max_hp = e.hp;
-        e.max_stamina = 150; e.stamina = 0;
-        e.damage = SECOND_LAST + 10; e.speed = rand() % 21 + 10;
-        e.lt_count = 0; e.waiting_for = ART_NONE;
-        memset(e.inventory, WPN_NONE, sizeof(e.inventory));
-        memset(e.long_term,  WPN_NONE, sizeof(e.long_term));
-    }
+    for (int i = 0; i < count; i++)
+        init_enemy(gs->enemies[i]);
     snprintf(gs->action_log, MAX_ACTION_LOG,
              "New wave! %d enemies approach...", count);
 }
@@ -392,9 +391,7 @@ static void execute_action() {
                 te_ptr->hp -= ae.damage; 
                 snprintf(gs->action_log, MAX_ACTION_LOG,
                          "Entity %d STRIKES entity %d for %d dmg", actor, target, ae.damage);
-                pthread_mutex_lock(&atk_trig.lock);
-                atk_trig.attacker = actor; atk_trig.target = target; atk_trig.fired = true;
-                pthread_mutex_unlock(&atk_trig.lock);
+                fire_attack_trigger(actor, target);
             } else {
                 snprintf(gs->action_log, MAX_ACTION_LOG, "Entity %d missed their strike!", actor);
             }
@@ -421,9 +418,7 @@ static void execute_action() {
                 te_ptr->hp -= WPN_DAMAGE[wpn]; 
                 snprintf(gs->action_log, MAX_ACTION_LOG,
                          "Entity %d uses %s → %d dmg!", actor, WPN_NAMES[wpn], WPN_DAMAGE[wpn]);
-                pthread_mutex_lock(&atk_trig.lock);
-                atk_trig.attacker = actor; atk_trig.target = target; atk_trig.fired = true;
-                pthread_mutex_unlock(&atk_trig.lock);
+                fire_attack_trigger(actor, target);
             }
             break;
 
@@ -791,14 +786,7 @@ static void* render_thread_func(void*) {
             }
 
             // ANIMATE SPRITE FRAMES DURING LUNGE
-            int p_frame = 0; // Default Idle frame
-            if (lng_actor == i) {
-                float tp = lng_timer / LNG_DUR;
-                if      (tp < 0.2f)  p_frame = 1; // Windup
-                else if (tp < 0.4f)  p_frame = 2; // Strike start
-                else if (tp < 0.62f) p_frame = 3; // Strike peak (impact)
-                else if (tp < 0.8f)  p_frame = 4; // Recover
-            }
+            int p_frame = (lng_actor == i) ? compute_lunge_frame(lng_timer, LNG_DUR) : 0;
 
 
                         // NEW TARGETING LOGIC FOR HEALING
@@ -866,15 +854,8 @@ static void* render_thread_func(void*) {
             else if (i%3==1&&hasR) et=&texR;
             else if (hasB)         et=&texB;
             
-            // ANIMATE SPRITE FRAMES DURING LUNGE 
-            int e_frame = 0; // Default Idle frame
-            if (lng_actor == eid) {
-                float tp = lng_timer / LNG_DUR;
-                if      (tp < 0.2f)  e_frame = 1; // Windup
-                else if (tp < 0.4f)  e_frame = 2; // Strike start
-                else if (tp < 0.62f) e_frame = 3; // Strike peak (impact)
-                else if (tp < 0.8f)  e_frame = 4; // Recover
-            }
+            // ANIMATE SPRITE FRAMES DURING LUNGE
+            int e_frame = (lng_actor == eid) ? compute_lunge_frame(lng_timer, LNG_DUR) : 0;
 
             if (et) draw_flipped(*et, e_frame, cx+ox, fy, true, !e.is_alive, flash[eid]);
             else {
