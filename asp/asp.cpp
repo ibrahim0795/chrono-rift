@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <errno.h>
 #include "../common.h"
+#include "../game_logic.h"
 
 using namespace std;
 
@@ -30,27 +31,7 @@ static void sigterm_handler(int sig) {
 // SIGSTOP / SIGCONT for the ultimate ability are delivered to the
 // entire ASP process and handled automatically by the OS.
 
-// Enemy AI decision
-// strike the first alive player with 80% probability, else skip.
-static void enemy_decide(int enemy_idx) {
-    int target = -1;
-    for (int i = 0; i < gs->num_players; i++)
-        if (gs->players[i].is_alive) { target = i; break; }
-    if (target == -1) return;
-
-    if (rand() % 10 < 8) {
-        gs->action_actor   = MAX_PLAYERS + enemy_idx;
-        gs->action_target  = target;
-        gs->pending_action = ACTION_STRIKE;
-        snprintf(gs->action_log, MAX_ACTION_LOG,
-                 "Enemy %d attacks Player %d!", enemy_idx + 1, target + 1);
-    } else {
-        gs->action_actor   = MAX_PLAYERS + enemy_idx;
-        gs->pending_action = ACTION_SKIP;
-        snprintf(gs->action_log, MAX_ACTION_LOG,
-                 "Enemy %d skips.", enemy_idx + 1);
-    }
-}
+// enemy_decide now lives in game_logic.cpp
 
 // Enemy thread
 struct EnemyThreadArg { int enemy_index; };
@@ -82,7 +63,7 @@ static void* enemy_thread_func(void* arg) {
 
         // Decide and post action 
         pthread_mutex_lock(&gs->memory_lock);
-        enemy_decide(idx);
+        enemy_decide(gs, idx);
         pthread_mutex_unlock(&gs->memory_lock);
 
         // Wait for the Arbiter to consume and clear the action.

@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <SFML/Graphics.hpp>
 #include "../common.h"
+#include "../game_logic.h"
 
 using namespace std;
 
@@ -44,61 +45,14 @@ static volatile float ultimate_flash_timer = 0.f;
 
 // Forward declarations 
 static void  init_game();
-static void  stamina_tick();
-static int   find_next_actor();
 static void  execute_action();
-static void  check_win_loss();
-static void  respawn_enemies();
 static void* render_thread_func(void*);
 static void* deadlock_monitor_func(void*);
 static void  signal_handler(int);
 static void  cleanup();
 static void  trigger_stun(int entity_idx, bool is_player);
-static void  send_ui_event(int action, int target, int weapon_id, int player_idx);
-static bool  pop_player_action(int player_idx, PlayerInputEvent* out);
 
-// Inventory helpers 
-static int find_contiguous_slots(Entity& e, int size) {
-    for (int i = 0; i <= INVENTORY_SIZE - size; i++) {
-        bool ok = true;
-        for (int j = i; j < i + size; j++)
-            if (e.inventory[j] != WPN_NONE) { ok = false; break; }
-        if (ok) return i;
-    }
-    return -1;
-}
-
-static void make_room(Entity& e, int size) {
-    while (find_contiguous_slots(e, size) == -1) {
-        for (int i = 0; i < INVENTORY_SIZE; i++) {
-            if (e.inventory[i] != WPN_NONE) {
-                int w = e.inventory[i], ws = WPN_SLOTS[w];
-                for (int j = i; j < i + ws && j < INVENTORY_SIZE; j++)
-                    e.inventory[j] = WPN_NONE;
-                if (e.lt_count < LONG_TERM_SIZE)
-                    e.long_term[e.lt_count++] = w;
-                snprintf(gs->action_log, MAX_ACTION_LOG,
-                         "Swapped %s to long-term storage", WPN_NAMES[w]);
-                break;
-            }
-        }
-    }
-}
-
-static bool pick_up_weapon(Entity& e, int id) {
-    int size = WPN_SLOTS[id];
-    int slot = find_contiguous_slots(e, size);
-    if (slot == -1) { make_room(e, size); slot = find_contiguous_slots(e, size); }
-    if (slot == -1) return false;
-    for (int i = slot; i < slot + size; i++) e.inventory[i] = id;
-    return true;
-}
-
-static bool entity_has_weapon(Entity& e, int wpn_id) {
-    for (int s = 0; s < INVENTORY_SIZE; s++)
-        if (e.inventory[s] == wpn_id) return true;
-    return false;
-}
+// Inventory helpers now live in game_logic.cpp
 
 // Process signals
 static void signal_handler(int sig) {
@@ -150,23 +104,16 @@ static void trigger_stun(int entity_idx, bool is_player) {
     pthread_detach(ct);
 }
 
-static void send_ui_event(int action, int target, int weapon_id, int player_idx) {
-    UIEvent ev{ action, target, weapon_id, player_idx };
+// send_ui_event and pop_player_action wrappers (lock-aware)
+static void send_ui_event_locked(int action, int target, int weapon_id, int player_idx) {
     pthread_mutex_lock(&gs->memory_lock);
-    if (gs->ui_events.count < UI_EVENT_CAP)
-        gs->ui_events.events[gs->ui_events.count++] = ev;
+    send_ui_event(gs, action, target, weapon_id, player_idx);
     pthread_mutex_unlock(&gs->memory_lock);
 }
 
-static bool pop_player_action(int player_idx, PlayerInputEvent* out) {
+static bool pop_player_action_locked(int player_idx, PlayerInputEvent* out) {
     pthread_mutex_lock(&gs->memory_lock);
-    PlayerActionBuffer& buf = gs->player_buffers[player_idx];
-    bool has = (buf.count > 0);
-    if (has) {
-        *out     = buf.events[buf.head];
-        buf.head = (buf.head + 1) % ACTION_BUF_CAP;
-        buf.count--;
-    }
+    bool has = pop_player_action(gs, player_idx, out);
     pthread_mutex_unlock(&gs->memory_lock);
     return has;
 }
@@ -274,59 +221,7 @@ static void init_game() {
          << "  Enemies:" << gs->num_enemies << endl;
 }
 
-// Respawn enemies
-static void respawn_enemies() {
-    int count = rand() % 3 + 2;
-    if (count > MAX_ENEMIES) count = MAX_ENEMIES;
-    gs->num_enemies = count;
-    for (int i = 0; i < count; i++) {
-        Entity& e = gs->enemies[i];
-        e.is_alive = true; e.is_stunned = false;
-        e.hp = LAST_TWO + (rand() % 151 + 50); e.max_hp = e.hp;
-        e.max_stamina = 150; e.stamina = 0;
-        e.damage = SECOND_LAST + 10; e.speed = rand() % 21 + 10;
-        e.lt_count = 0; e.waiting_for = ART_NONE;
-        memset(e.inventory, WPN_NONE, sizeof(e.inventory));
-        memset(e.long_term,  WPN_NONE, sizeof(e.long_term));
-    }
-    snprintf(gs->action_log, MAX_ACTION_LOG,
-             "New wave! %d enemies approach...", count);
-}
-
-static void stamina_tick() {
-    pthread_mutex_lock(&gs->memory_lock);
-    for (int i = 0; i < gs->num_players; i++) {
-        Entity& p = gs->players[i];
-        if (!p.is_alive || p.is_stunned) continue;
-        p.stamina += p.speed;
-        if (p.stamina > p.max_stamina) p.stamina = p.max_stamina;
-    }
-    if (!gs->ultimate_pause) {
-        for (int i = 0; i < gs->num_enemies; i++) {
-            Entity& e = gs->enemies[i];
-            if (!e.is_alive || e.is_stunned) continue;
-            e.stamina += e.speed;
-            if (e.stamina > e.max_stamina) e.stamina = e.max_stamina;
-        }
-    }
-    pthread_mutex_unlock(&gs->memory_lock);
-}
-
-// Find next actor
-static int find_next_actor() {
-    int best = -1, best_sta = -1;
-    for (int i = 0; i < gs->num_players; i++) {
-        Entity& p = gs->players[i];
-        if (p.is_alive && !p.is_stunned && p.stamina >= p.max_stamina)
-            if (p.stamina > best_sta) { best_sta = p.stamina; best = i; }
-    }
-    for (int i = 0; i < gs->num_enemies; i++) {
-        Entity& e = gs->enemies[i];
-        if (e.is_alive && !e.is_stunned && e.stamina >= e.max_stamina)
-            if (e.stamina > best_sta) { best_sta = e.stamina; best = MAX_PLAYERS + i; }
-    }
-    return best;
-}
+// respawn_enemies, stamina_tick, find_next_actor now live in game_logic.cpp
 
 // Execute action 
 static void execute_action() {
@@ -428,7 +323,7 @@ static void execute_action() {
         case ACTION_SWAP_IN:
             if (wpn >= 0 && wpn < ae.lt_count) {
                 int wid = ae.long_term[wpn];
-                pick_up_weapon(ae, wid);
+                pick_up_weapon(gs, ae, wid);
                 for (int k = wpn; k < ae.lt_count - 1; k++) ae.long_term[k] = ae.long_term[k+1];
                 ae.lt_count--; 
                 snprintf(gs->action_log, MAX_ACTION_LOG,
@@ -476,16 +371,7 @@ static void execute_action() {
     pthread_mutex_unlock(&gs->memory_lock);
 }
 
-// Check win/loss + respawn 
-static void check_win_loss() {
-    if (gs->enemies_killed >= 10) { gs->is_game_over = true; gs->player_won = true; return; }
-    bool any_e = false;
-    for (int i = 0; i < gs->num_enemies; i++) if (gs->enemies[i].is_alive) { any_e = true; break; }
-    if (!any_e && gs->enemies_killed < 10) respawn_enemies();
-    bool any_p = false;
-    for (int i = 0; i < gs->num_players; i++) if (gs->players[i].is_alive) { any_p = true; break; }
-    if (!any_p) { gs->is_game_over = true; gs->player_won = false; }
-}
+// check_win_loss now lives in game_logic.cpp
 
 // Deadlock monitor
 static void* deadlock_monitor_func(void*) {
@@ -775,7 +661,7 @@ static void* render_thread_func(void*) {
 
             if (p.is_alive && ui_mode == 6 && left_clicked) {
                 if (p_hitbox.contains((float)mouse.x,(float)mouse.y)) {
-                    send_ui_event(ACTION_HEAL, i, -1, gs->active_turn);
+                    send_ui_event_locked(ACTION_HEAL, i, -1, gs->active_turn);
                     ui_mode = 0;
                 }
             }
@@ -866,9 +752,9 @@ static void* render_thread_func(void*) {
             if (e.is_alive && (ui_mode==1||ui_mode==2||ui_mode==5) && left_clicked) {
                 if (hitbox.contains((float)mouse.x,(float)mouse.y)) {
                     int active = gs->active_turn;
-                    if (ui_mode==1)      send_ui_event(ACTION_STRIKE,    eid, -1,          active);
-                    else if (ui_mode==2) send_ui_event(ACTION_EXHAUST,   eid, -1,          active);
-                    else                 send_ui_event(ACTION_USE_WEAPON, eid, ui_weapon_sel, active);
+                    if (ui_mode==1)      send_ui_event_locked(ACTION_STRIKE,    eid, -1,          active);
+                    else if (ui_mode==2) send_ui_event_locked(ACTION_EXHAUST,   eid, -1,          active);
+                    else                 send_ui_event_locked(ACTION_USE_WEAPON, eid, ui_weapon_sel, active);
                     ui_weapon_sel=-1; ui_mode=0;
                 }
             }
@@ -954,7 +840,7 @@ static void* render_thread_func(void*) {
                 if (pick_hov) {
                     pthread_mutex_lock(&gs->memory_lock);
                     if (for_player>=0&&for_player<gs->num_players)
-                        pick_up_weapon(gs->players[for_player],wpn_id);
+                        pick_up_weapon(gs, gs->players[for_player],wpn_id);
                     gs->weapon_drop.pending=false; gs->weapon_drop.decision=1;
                     snprintf(gs->action_log,MAX_ACTION_LOG,"Player %d picked up %s!",
                              for_player+1,wpn_id>=0&&wpn_id<WPN_COUNT?WPN_NAMES[wpn_id]:"?");
@@ -965,7 +851,7 @@ static void* render_thread_func(void*) {
                     // an enemy is GUARANTEED to pick it up.
                     for (int i=0;i<gs->num_enemies;i++) {
                         if (gs->enemies[i].is_alive) {
-                            pick_up_weapon(gs->enemies[i],wpn_id);
+                            pick_up_weapon(gs, gs->enemies[i],wpn_id);
                             snprintf(gs->action_log,MAX_ACTION_LOG,
                                      "Enemy %d picked up %s!",
                                      i+1,
@@ -1005,7 +891,7 @@ static void* render_thread_func(void*) {
             if (draw_button(win,font,"Heal", bx+2*(bw+gap),by,bw,bh,mouse)&&left_clicked&&ui_mode==0)
                     ui_mode = 6;
             if (draw_button(win,font,"Skip",    bx+3*(bw+gap),by,bw,bh,mouse)&&left_clicked&&ui_mode==0)
-                { send_ui_event(ACTION_SKIP,  -1, -1, active); ui_mode=0; }
+                { send_ui_event_locked(ACTION_SKIP,  -1, -1, active); ui_mode=0; }
 
             // Row 2
             float by2=by+bh+gap;
@@ -1013,10 +899,10 @@ static void* render_thread_func(void*) {
             if (draw_button(win,font,"Swap In",   bx+(bw+gap),  by2,bw,bh,mouse)&&left_clicked&&ui_mode==0) ui_mode=4;
             if (draw_button(win,font,"ULTIMATE",  bx+2*(bw+gap),by2,bw,bh,mouse,ui_can_ultimate,{60,30,100,220})
                 &&left_clicked&&ui_mode==0&&ui_can_ultimate)
-                { send_ui_event(ACTION_ULTIMATE,-1,-1,active); ui_mode=0; }
+                { send_ui_event_locked(ACTION_ULTIMATE,-1,-1,active); ui_mode=0; }
             if (draw_button(win,font,"Quit",      bx+3*(bw+gap),by2,bw,bh,mouse,true,{80,20,20,200})
                 &&left_clicked&&ui_mode==0)
-                { send_ui_event(ACTION_QUIT,-1,-1,active); gs->is_game_over=true; running=false; }
+                { send_ui_event_locked(ACTION_QUIT,-1,-1,active); gs->is_game_over=true; running=false; }
 
             // Mode hint
             const char* hints[]={"","Click an enemy to Strike","Click an enemy to Exhaust",
@@ -1066,7 +952,7 @@ static void* render_thread_func(void*) {
                     if (hitbox.contains((float)mouse.x,(float)mouse.y)) {
                         hl=true;
                         // k is the long-term slot index, weapon_id carries it
-                        if (left_clicked) { send_ui_event(ACTION_SWAP_IN,-1,k,active); ui_mode=0; }
+                        if (left_clicked) { send_ui_event_locked(ACTION_SWAP_IN,-1,k,active); ui_mode=0; }
                     }
                     draw_weapon_icon(win,font,wid,slx,sly,slot_s,hl);
                 }
@@ -1124,10 +1010,12 @@ int main() {
         while (gs->weapon_drop.pending && !gs->is_game_over)
             usleep(50000);
 
-        stamina_tick();
+        pthread_mutex_lock(&gs->memory_lock);
+        stamina_tick(gs);
+        pthread_mutex_unlock(&gs->memory_lock);
         usleep(1000000);   // 1 second per tick, spec says "each second speed is added"
 
-        int actor = find_next_actor();
+        int actor = find_next_actor(gs);
         if (actor == -1) continue;
         gs->active_turn = actor;
 
@@ -1137,7 +1025,7 @@ int main() {
             int timeout = 0;
 
             while (!pie.valid && !gs->is_game_over) {
-                if (pop_player_action(actor, &pie)) break;
+                if (pop_player_action_locked(actor, &pie)) break;
                 usleep(50000);
                 if (++timeout > 200) {
                     pie = {ACTION_SKIP, -1, -1, true};
@@ -1175,7 +1063,7 @@ int main() {
         }
 
         execute_action();
-        check_win_loss();
+        check_win_loss(gs);
     }
 
     cout << (gs->player_won ? "Players WIN!" : "GAME OVER") << endl;
