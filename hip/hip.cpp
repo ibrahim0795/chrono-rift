@@ -9,34 +9,13 @@
 #include <signal.h>
 #include <errno.h>
 #include "../common.h"
+#include "../shared/shared_utils.h"
 
 using namespace std;
 
 // Process-level globals 
 static GameState* gs      = nullptr;
 static bool       running = true;
-
-static void stun_handler(int) {
-    sleep(3);  
-}
-
-static void sigterm_handler(int) {
-    running = false;
-}
-
-static void attach_shared_memory() {
-    int fd = -1;
-    for (int i = 0; i < 10 && fd == -1; i++) {
-        fd = shm_open(SHARED_MEM_NAME, O_RDWR, 0666);
-        if (fd == -1) sleep(1);
-    }
-    if (fd == -1) { perror("HIP: shm_open"); exit(1); }
-
-    gs = (GameState*)mmap(nullptr, sizeof(GameState),
-                          PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (gs == MAP_FAILED) { perror("HIP: mmap"); exit(1); }
-    if (close(fd) == -1) perror("HIP: close shm fd");
-}
 
 static void push_player_action(int player_idx, int action, int target, int weapon_id)
 {
@@ -68,11 +47,7 @@ static void* player_thread_func(void* arg) {
     gs->hip_thread_tids[idx] = pthread_self();
 
     // unblock SIGUSR1 in this thread only
-    sigset_t unblock;
-    sigemptyset(&unblock);
-    sigaddset(&unblock, SIGUSR1);
-    if (pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr) != 0)
-        perror("HIP: pthread_sigmask SIG_UNBLOCK");
+    unblock_sigusr1_current_thread();
 
     cout << "HIP: Player " << idx + 1
          << " thread ready  (tid=" << pthread_self() << ")" << endl;
@@ -123,29 +98,11 @@ static void* player_thread_func(void* arg) {
 
 // main
 int main() {
-
-    sigset_t block_usr1;
-    sigemptyset(&block_usr1);
-    sigaddset(&block_usr1, SIGUSR1);
-    if (pthread_sigmask(SIG_BLOCK, &block_usr1, nullptr) != 0) {
-        perror("HIP: pthread_sigmask SIG_BLOCK"); exit(1);
-    }
-
-    struct sigaction sa{};
-    sa.sa_handler = stun_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags   = 0;   // no SA_RESTART
-    if (sigaction(SIGUSR1, &sa, nullptr) == -1) {
-        perror("HIP: sigaction SIGUSR1"); exit(1);
-    }
-
-    if (signal(SIGTERM, sigterm_handler) == SIG_ERR) {
-        perror("HIP: signal SIGTERM"); exit(1);
-    }
+    install_stun_and_term_handlers(&running);
 
     // Attach to shared memory created by Arbiter
     cout << "HIP: Connecting to shared memory..." << endl;
-    attach_shared_memory();
+    gs = attach_shared_memory("HIP");
 
     gs->hip_pid = getpid();
     for (int i = 0; i < gs->num_players; i++)

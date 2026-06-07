@@ -9,23 +9,13 @@
 #include <signal.h>
 #include <errno.h>
 #include "../common.h"
+#include "../shared/shared_utils.h"
 
 using namespace std;
 
 // Globals 
 static GameState* gs      = nullptr;
 static bool       running = true;
-
-
-static void stun_handler(int sig) {
-    (void)sig;
-    sleep(3); 
-}
-
-static void sigterm_handler(int sig) {
-    (void)sig;
-    running = false;
-}
 
 // SIGSTOP / SIGCONT for the ultimate ability are delivered to the
 // entire ASP process and handled automatically by the OS.
@@ -62,14 +52,9 @@ static void* enemy_thread_func(void* arg) {
     //Register this thread's tid for targeted stun signals
     gs->asp_thread_tids[idx] = pthread_self();
 
-    // Unblock SIGUSR1 in this thread only 
-    // main() blocks SIGUSR1 process-wide.  Each enemy thread unblocks it
-    // for itself so only the correct thread receives the stun signal.
-    sigset_t unblock;
-    sigemptyset(&unblock);
-    sigaddset(&unblock, SIGUSR1);
-    if (pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr) != 0)
-        perror("ASP: pthread_sigmask SIG_UNBLOCK");
+    // Unblock SIGUSR1 in this thread so only the correct thread
+    // receives the stun signal.
+    unblock_sigusr1_current_thread();
 
     while (running && !gs->is_game_over) {
         if (idx >= gs->num_enemies) { usleep(100000); continue; }
@@ -94,45 +79,12 @@ static void* enemy_thread_func(void* arg) {
     return nullptr;
 }
 
-// Attach to shared memory 
-static void attach_shared_memory() {
-    int fd = -1;
-    for (int i = 0; i < 10 && fd == -1; i++) {
-        fd = shm_open(SHARED_MEM_NAME, O_RDWR, 0666);
-        if (fd == -1) sleep(1);
-    }
-    if (fd == -1) { perror("ASP: shm_open"); exit(1); }
-
-    gs = (GameState*)mmap(nullptr, sizeof(GameState),
-                          PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (gs == MAP_FAILED) { perror("ASP: mmap"); exit(1); }
-    if (close(fd) == -1) perror("ASP: close shm fd");
-}
-
 // main 
 int main() {
-    //Block SIGUSR1 process-wide; threads unblock it individually 
-    sigset_t block_usr1;
-    sigemptyset(&block_usr1);
-    sigaddset(&block_usr1, SIGUSR1);
-    if (pthread_sigmask(SIG_BLOCK, &block_usr1, nullptr) != 0) {
-        perror("ASP: pthread_sigmask SIG_BLOCK"); exit(1);
-    }
-
-    struct sigaction sa{};
-    sa.sa_handler = stun_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags   = 0;
-    if (sigaction(SIGUSR1, &sa, nullptr) == -1) {
-        perror("ASP: sigaction SIGUSR1"); exit(1);
-    }
-
-    if (signal(SIGTERM, sigterm_handler) == SIG_ERR) {
-        perror("ASP: signal SIGTERM"); exit(1);
-    }
+    install_stun_and_term_handlers(&running);
 
     cout << "ASP: Connecting to shared memory..." << endl;
-    attach_shared_memory();
+    gs = attach_shared_memory("ASP");
 
     gs->asp_pid = getpid();
     srand(ROLL_SEED + 1);
