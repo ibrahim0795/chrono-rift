@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <SFML/Graphics.hpp>
 #include "../common.h"
+#include "../shared/shared_utils.h"
 #include "../game_logic.h"
 
 using namespace std;
@@ -52,6 +53,25 @@ static void  signal_handler(int);
 static void  cleanup();
 static void  trigger_stun(int entity_idx, bool is_player);
 
+// Attack-trigger helper (render thread reads this to animate lunges)
+static void fire_attack_trigger(int attacker, int target) {
+    pthread_mutex_lock(&atk_trig.lock);
+    atk_trig.attacker = attacker;
+    atk_trig.target   = target;
+    atk_trig.fired    = true;
+    pthread_mutex_unlock(&atk_trig.lock);
+}
+
+// Lunge animation frame from normalised progress
+static int compute_lunge_frame(float timer, float duration) {
+    float tp = timer / duration;
+    if      (tp < 0.2f)  return 1;
+    else if (tp < 0.4f)  return 2;
+    else if (tp < 0.62f) return 3;
+    else if (tp < 0.8f)  return 4;
+    return 0;
+}
+
 // Inventory helpers now live in game_logic.cpp
 
 // Process signals
@@ -81,7 +101,8 @@ static void trigger_stun(int entity_idx, bool is_player) {
 
     // Safely send the signal across processes using POSIX kill()
     if (target_pid > 0) {
-        kill(target_pid, SIGUSR1);
+        if (kill(target_pid, SIGUSR1) == -1)
+            perror("Arbiter: kill SIGUSR1 for stun");
     }
 
     // Detached helper clears the visual flag after 3 s.
@@ -89,7 +110,7 @@ static void trigger_stun(int entity_idx, bool is_player) {
     ClearArg* ca = new ClearArg{entity_idx, is_player};
 
     pthread_t ct;
-    pthread_create(&ct, nullptr, [](void* p) -> void* {
+    int rc = pthread_create(&ct, nullptr, [](void* p) -> void* {
         ClearArg* a = (ClearArg*)p;
         sleep(3);
         pthread_mutex_lock(&gs->memory_lock);
@@ -101,6 +122,11 @@ static void trigger_stun(int entity_idx, bool is_player) {
         delete a;
         return nullptr;
     }, ca);
+    if (rc != 0) {
+        cerr << "Arbiter: failed to create stun-clear thread: " << strerror(rc) << endl;
+        delete ca;
+        return;
+    }
     pthread_detach(ct);
 }
 
@@ -122,20 +148,31 @@ static bool pop_player_action_locked(int player_idx, PlayerInputEvent* out) {
 static void init_shared_memory() {
     int fd = shm_open(SHARED_MEM_NAME, O_CREAT | O_RDWR, 0666);
     if (fd == -1) { perror("shm_open"); exit(1); }
-    ftruncate(fd, sizeof(GameState));
+    if (ftruncate(fd, sizeof(GameState)) == -1) {
+        perror("Arbiter: ftruncate"); close(fd); exit(1);
+    }
     gs = (GameState*)mmap(nullptr, sizeof(GameState),
                           PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (gs == MAP_FAILED) { perror("mmap"); exit(1); }
-    close(fd);
+    if (close(fd) == -1) perror("Arbiter: close shm fd");
     memset(gs, 0, sizeof(GameState));
 
     pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-    pthread_mutex_init(&gs->memory_lock, &attr);
+    int rc;
+    if ((rc = pthread_mutexattr_init(&attr)) != 0) {
+        cerr << "Arbiter: pthread_mutexattr_init failed: " << strerror(rc) << endl; exit(1);
+    }
+    if ((rc = pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED)) != 0) {
+        cerr << "Arbiter: pthread_mutexattr_setpshared failed: " << strerror(rc) << endl; exit(1);
+    }
+    if ((rc = pthread_mutex_init(&gs->memory_lock, &attr)) != 0) {
+        cerr << "Arbiter: pthread_mutex_init failed: " << strerror(rc) << endl; exit(1);
+    }
     pthread_mutexattr_destroy(&attr);
     // Init atk_trig mutex (process-local, render thread + game loop)
-    pthread_mutex_init(&atk_trig.lock, nullptr);
+    if ((rc = pthread_mutex_init(&atk_trig.lock, nullptr)) != 0) {
+        cerr << "Arbiter: atk_trig mutex init failed: " << strerror(rc) << endl; exit(1);
+    }
 }
 
 static void init_game() {
@@ -143,8 +180,14 @@ static void init_game() {
     cout << "=== CHRONO RIFT ===" << endl;
     cout << "Enter number of players (1-" << MAX_PLAYERS << "): ";
     cin >> gs->num_players;
-    if (gs->num_players < 1 || gs->num_players > MAX_PLAYERS)
+    if (cin.fail()) {
+        cerr << "Arbiter: invalid input for player count, defaulting to 1" << endl;
+        cin.clear();
+        cin.ignore(256, '\n');
         gs->num_players = 1;
+    } else if (gs->num_players < 1 || gs->num_players > MAX_PLAYERS) {
+        gs->num_players = 1;
+    }
 
     for (int i = 0; i < gs->num_players; i++) {
         Entity& p     = gs->players[i];
@@ -168,21 +211,8 @@ static void init_game() {
     }
 
     gs->num_enemies = rand() % 8 + 2;
-    for (int i = 0; i < gs->num_enemies; i++) {
-        Entity& e     = gs->enemies[i];
-        e.is_alive    = true;
-        e.is_stunned  = false;
-        e.hp          = LAST_TWO + (rand() % 151 + 50);
-        e.max_hp      = e.hp;
-        e.max_stamina = 150;
-        e.stamina     = 0;
-        e.damage      = SECOND_LAST + 10;
-        e.speed       = rand() % 21 + 10;
-        e.lt_count    = 0;
-        e.waiting_for = ART_NONE;
-        memset(e.inventory, WPN_NONE, sizeof(e.inventory));
-        memset(e.long_term,  WPN_NONE, sizeof(e.long_term));
-    }
+    for (int i = 0; i < gs->num_enemies; i++)
+        init_enemy(gs->enemies[i]);
 
     gs->is_game_over  = false;
     gs->player_won    = false;
@@ -260,9 +290,7 @@ static void execute_action() {
                 te_ptr->hp -= ae.damage; 
                 snprintf(gs->action_log, MAX_ACTION_LOG,
                          "Entity %d STRIKES entity %d for %d dmg", actor, target, ae.damage);
-                pthread_mutex_lock(&atk_trig.lock);
-                atk_trig.attacker = actor; atk_trig.target = target; atk_trig.fired = true;
-                pthread_mutex_unlock(&atk_trig.lock);
+                fire_attack_trigger(actor, target);
             } else {
                 snprintf(gs->action_log, MAX_ACTION_LOG, "Entity %d missed their strike!", actor);
             }
@@ -289,15 +317,14 @@ static void execute_action() {
                 te_ptr->hp -= WPN_DAMAGE[wpn]; 
                 snprintf(gs->action_log, MAX_ACTION_LOG,
                          "Entity %d uses %s → %d dmg!", actor, WPN_NAMES[wpn], WPN_DAMAGE[wpn]);
-                pthread_mutex_lock(&atk_trig.lock);
-                atk_trig.attacker = actor; atk_trig.target = target; atk_trig.fired = true;
-                pthread_mutex_unlock(&atk_trig.lock);
+                fire_attack_trigger(actor, target);
             }
             break;
 
         case ACTION_ULTIMATE:
             gs->ultimate_pause = true; ultimate_flash_timer = 1.5f;
-            if (gs->asp_pid > 0) kill(gs->asp_pid, SIGSTOP);
+            if (gs->asp_pid > 0 && kill(gs->asp_pid, SIGSTOP) == -1)
+                perror("Arbiter: kill SIGSTOP for ultimate");
             alarm(10);
             for (int i = 0; i < gs->num_enemies; i++)
                 if (gs->enemies[i].is_alive) gs->enemies[i].hp -= (ae.damage * 3);
@@ -323,11 +350,15 @@ static void execute_action() {
         case ACTION_SWAP_IN:
             if (wpn >= 0 && wpn < ae.lt_count) {
                 int wid = ae.long_term[wpn];
-                pick_up_weapon(gs, ae, wid);
-                for (int k = wpn; k < ae.lt_count - 1; k++) ae.long_term[k] = ae.long_term[k+1];
-                ae.lt_count--; 
-                snprintf(gs->action_log, MAX_ACTION_LOG,
-                         "Entity %d swapped in %s", actor, WPN_NAMES[wid]);
+                if (!pick_up_weapon(gs, ae, wid)) {
+                    snprintf(gs->action_log, MAX_ACTION_LOG,
+                             "Entity %d failed to swap in %s — no room!", actor, WPN_NAMES[wid]);
+                } else {
+                    for (int k = wpn; k < ae.lt_count - 1; k++) ae.long_term[k] = ae.long_term[k+1];
+                    ae.lt_count--; 
+                    snprintf(gs->action_log, MAX_ACTION_LOG,
+                             "Entity %d swapped in %s", actor, WPN_NAMES[wid]);
+                }
             }
             break;
     }
@@ -410,14 +441,20 @@ static void* deadlock_monitor_func(void*) {
 
 static void cleanup() {
     // Notify HIP and ASP to exit cleanly before destroying shared memory.
-    if (gs->hip_pid > 0) kill(gs->hip_pid, SIGTERM);
-    if (gs->asp_pid > 0) kill(gs->asp_pid, SIGTERM);
+    if (gs->hip_pid > 0 && kill(gs->hip_pid, SIGTERM) == -1)
+        perror("Arbiter: kill HIP");
+    if (gs->asp_pid > 0 && kill(gs->asp_pid, SIGTERM) == -1)
+        perror("Arbiter: kill ASP");
     // Give them 1 second to unmap and exit before we destroy the segment.
     usleep(1000000);
-    pthread_mutex_destroy(&gs->memory_lock);
-    pthread_mutex_destroy(&atk_trig.lock);
-    munmap(gs, sizeof(GameState));
-    shm_unlink(SHARED_MEM_NAME);
+    if (pthread_mutex_destroy(&gs->memory_lock) != 0)
+        perror("Arbiter: pthread_mutex_destroy memory_lock");
+    if (pthread_mutex_destroy(&atk_trig.lock) != 0)
+        perror("Arbiter: pthread_mutex_destroy atk_trig");
+    if (munmap(gs, sizeof(GameState)) == -1)
+        perror("Arbiter: munmap");
+    if (shm_unlink(SHARED_MEM_NAME) == -1)
+        perror("Arbiter: shm_unlink");
     cout << "Arbiter: cleaned up." << endl;
 }
 
@@ -529,7 +566,8 @@ static void* render_thread_func(void*) {
 
     sf::Font font;
     if (!font.loadFromFile("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"))
-        font.loadFromFile("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+        if (!font.loadFromFile("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
+            cerr << "Arbiter: failed to load any font — text will not render" << endl;
 
     sf::Texture texP, texS, texR, texB, bg_tex;
     bool hasP  = texP.loadFromFile("Sprites/players.png");
@@ -638,14 +676,7 @@ static void* render_thread_func(void*) {
             }
 
             // ANIMATE SPRITE FRAMES DURING LUNGE
-            int p_frame = 0; // Default Idle frame
-            if (lng_actor == i) {
-                float tp = lng_timer / LNG_DUR;
-                if      (tp < 0.2f)  p_frame = 1; // Windup
-                else if (tp < 0.4f)  p_frame = 2; // Strike start
-                else if (tp < 0.62f) p_frame = 3; // Strike peak (impact)
-                else if (tp < 0.8f)  p_frame = 4; // Recover
-            }
+            int p_frame = (lng_actor == i) ? compute_lunge_frame(lng_timer, LNG_DUR) : 0;
 
 
                         // NEW TARGETING LOGIC FOR HEALING
@@ -713,15 +744,8 @@ static void* render_thread_func(void*) {
             else if (i%3==1&&hasR) et=&texR;
             else if (hasB)         et=&texB;
             
-            // ANIMATE SPRITE FRAMES DURING LUNGE 
-            int e_frame = 0; // Default Idle frame
-            if (lng_actor == eid) {
-                float tp = lng_timer / LNG_DUR;
-                if      (tp < 0.2f)  e_frame = 1; // Windup
-                else if (tp < 0.4f)  e_frame = 2; // Strike start
-                else if (tp < 0.62f) e_frame = 3; // Strike peak (impact)
-                else if (tp < 0.8f)  e_frame = 4; // Recover
-            }
+            // ANIMATE SPRITE FRAMES DURING LUNGE
+            int e_frame = (lng_actor == eid) ? compute_lunge_frame(lng_timer, LNG_DUR) : 0;
 
             if (et) draw_flipped(*et, e_frame, cx+ox, fy, true, !e.is_alive, flash[eid]);
             else {
@@ -839,8 +863,11 @@ static void* render_thread_func(void*) {
             if (left_clicked) {
                 if (pick_hov) {
                     pthread_mutex_lock(&gs->memory_lock);
-                    if (for_player>=0&&for_player<gs->num_players)
-                        pick_up_weapon(gs, gs->players[for_player],wpn_id);
+                    if (for_player>=0&&for_player<gs->num_players) {
+                        if (!pick_up_weapon(gs, gs->players[for_player],wpn_id))
+                            cerr << "Arbiter: Player " << for_player+1
+                                 << " could not pick up weapon (no room)" << endl;
+                    }
                     gs->weapon_drop.pending=false; gs->weapon_drop.decision=1;
                     snprintf(gs->action_log,MAX_ACTION_LOG,"Player %d picked up %s!",
                              for_player+1,wpn_id>=0&&wpn_id<WPN_COUNT?WPN_NAMES[wpn_id]:"?");
@@ -851,7 +878,9 @@ static void* render_thread_func(void*) {
                     // an enemy is GUARANTEED to pick it up.
                     for (int i=0;i<gs->num_enemies;i++) {
                         if (gs->enemies[i].is_alive) {
-                            pick_up_weapon(gs, gs->enemies[i],wpn_id);
+                            if (!pick_up_weapon(gs, gs->enemies[i],wpn_id))
+                                cerr << "Arbiter: Enemy " << i+1
+                                     << " could not pick up weapon (no room)" << endl;
                             snprintf(gs->action_log,MAX_ACTION_LOG,
                                      "Enemy %d picked up %s!",
                                      i+1,
@@ -991,16 +1020,21 @@ static void* render_thread_func(void*) {
 
 //main
 int main() {
-    signal(SIGTERM, signal_handler);
-    signal(SIGCHLD, signal_handler);
-    signal(SIGALRM, signal_handler);
+    if (signal(SIGTERM, signal_handler) == SIG_ERR) { perror("Arbiter: signal SIGTERM"); exit(1); }
+    if (signal(SIGCHLD, signal_handler) == SIG_ERR) { perror("Arbiter: signal SIGCHLD"); exit(1); }
+    if (signal(SIGALRM, signal_handler) == SIG_ERR) { perror("Arbiter: signal SIGALRM"); exit(1); }
 
     init_shared_memory();
     init_game();
 
     pthread_t rtid, dtid;
-    pthread_create(&rtid, nullptr, render_thread_func,    nullptr);
-    pthread_create(&dtid, nullptr, deadlock_monitor_func, nullptr);
+    int rc;
+    if ((rc = pthread_create(&rtid, nullptr, render_thread_func, nullptr)) != 0) {
+        cerr << "Arbiter: failed to create render thread: " << strerror(rc) << endl; exit(1);
+    }
+    if ((rc = pthread_create(&dtid, nullptr, deadlock_monitor_func, nullptr)) != 0) {
+        cerr << "Arbiter: failed to create deadlock monitor thread: " << strerror(rc) << endl; exit(1);
+    }
 
     cout << "Arbiter: waiting for HIP and ASP..." << endl;
     sleep(2);
