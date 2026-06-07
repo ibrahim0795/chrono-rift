@@ -28,7 +28,7 @@ static void sigterm_handler(int) {
 GameState* attach_shared_memory(const char* process_name) {
     int fd = -1;
     for (int i = 0; i < 10 && fd == -1; i++) {
-        fd = shm_open(SHARED_MEM_NAME, O_RDWR, 0666);
+        fd = shm_open(SHARED_MEM_NAME, O_RDWR, 0600);
         if (fd == -1) sleep(1);
     }
     if (fd == -1) {
@@ -77,8 +77,11 @@ void install_stun_and_term_handlers(bool* running_flag) {
     }
 
     // SIGTERM → set running flag to false.
-    if (signal(SIGTERM, sigterm_handler) == SIG_ERR) {
-        perror("signal SIGTERM");
+    struct sigaction sa_term{};
+    sa_term.sa_handler = sigterm_handler;
+    sigemptyset(&sa_term.sa_mask);
+    if (sigaction(SIGTERM, &sa_term, nullptr) == -1) {
+        perror("sigaction SIGTERM");
         exit(1);
     }
 }
