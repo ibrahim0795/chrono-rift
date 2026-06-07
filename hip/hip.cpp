@@ -17,6 +17,7 @@ using namespace std;
 static GameState* gs      = nullptr;
 static bool       running = true;
 
+
 static void push_player_action(int player_idx, int action, int target, int weapon_id)
 {
     pthread_mutex_lock(&gs->memory_lock);

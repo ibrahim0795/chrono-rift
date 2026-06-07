@@ -17,5 +17,9 @@ COPY requirements.txt /tmp/requirements.txt
 RUN grep -v ^# /tmp/requirements.txt | grep -v '^$' | \
     xargs -r apt-get install -y && rm -rf /var/lib/apt/lists/*
 
+RUN useradd -m -s /bin/bash appuser
+
 WORKDIR /app
+
+USER appuser
 CMD ["bash"]
