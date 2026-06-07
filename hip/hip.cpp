@@ -10,6 +10,7 @@
 #include <errno.h>
 #include "../common.h"
 #include "../shared/shared_utils.h"
+#include "../game_logic.h"
 
 using namespace std;
 
@@ -18,23 +19,10 @@ static GameState* gs      = nullptr;
 static bool       running = true;
 
 
-static void push_player_action(int player_idx, int action, int target, int weapon_id)
+static void push_player_action_locked(int player_idx, int action, int target, int weapon_id)
 {
     pthread_mutex_lock(&gs->memory_lock);
-
-    PlayerActionBuffer& buf = gs->player_buffers[player_idx];
-    if (buf.count < ACTION_BUF_CAP) {
-        PlayerInputEvent& ev = buf.events[buf.tail];
-        ev.action    = action;
-        ev.target    = target;
-        ev.weapon_id = weapon_id;
-        ev.valid     = true;
-        buf.tail  = (buf.tail + 1) % ACTION_BUF_CAP;
-        buf.count++;
-    } else {
-        cerr << "HIP: action buffer full for player " << player_idx
-             << " — dropped action " << action << endl;
-    }
+    push_player_action(gs, player_idx, action, target, weapon_id);
     pthread_mutex_unlock(&gs->memory_lock);
 }
 
@@ -87,7 +75,7 @@ static void* player_thread_func(void* arg) {
 
         if (got_event) {
             // Forward the resolved action to the Arbiter via the ring-buffer.
-            push_player_action(idx, uev.action, uev.target, uev.weapon_id);
+            push_player_action_locked(idx, uev.action, uev.target, uev.weapon_id);
         } else {
             usleep(10000);   // 10 ms poll interval
         }
