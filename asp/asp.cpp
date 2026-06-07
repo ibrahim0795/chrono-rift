@@ -68,7 +68,8 @@ static void* enemy_thread_func(void* arg) {
     sigset_t unblock;
     sigemptyset(&unblock);
     sigaddset(&unblock, SIGUSR1);
-    pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
+    if (pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr) != 0)
+        perror("ASP: pthread_sigmask SIG_UNBLOCK");
 
     while (running && !gs->is_game_over) {
         if (idx >= gs->num_enemies) { usleep(100000); continue; }
@@ -105,7 +106,7 @@ static void attach_shared_memory() {
     gs = (GameState*)mmap(nullptr, sizeof(GameState),
                           PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (gs == MAP_FAILED) { perror("ASP: mmap"); exit(1); }
-    close(fd);
+    if (close(fd) == -1) perror("ASP: close shm fd");
 }
 
 // main 
@@ -114,15 +115,21 @@ int main() {
     sigset_t block_usr1;
     sigemptyset(&block_usr1);
     sigaddset(&block_usr1, SIGUSR1);
-    pthread_sigmask(SIG_BLOCK, &block_usr1, nullptr);
+    if (pthread_sigmask(SIG_BLOCK, &block_usr1, nullptr) != 0) {
+        perror("ASP: pthread_sigmask SIG_BLOCK"); exit(1);
+    }
 
     struct sigaction sa{};
     sa.sa_handler = stun_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags   = 0;
-    sigaction(SIGUSR1, &sa, nullptr);
+    if (sigaction(SIGUSR1, &sa, nullptr) == -1) {
+        perror("ASP: sigaction SIGUSR1"); exit(1);
+    }
 
-    signal(SIGTERM, sigterm_handler);
+    if (signal(SIGTERM, sigterm_handler) == SIG_ERR) {
+        perror("ASP: signal SIGTERM"); exit(1);
+    }
 
     cout << "ASP: Connecting to shared memory..." << endl;
     attach_shared_memory();
@@ -141,13 +148,19 @@ int main() {
 
     for (int i = 0; i < MAX_ENEMIES; i++) {
         args[i].enemy_index = i;
-        pthread_create(&threads[i], nullptr, enemy_thread_func, &args[i]);
+        int rc = pthread_create(&threads[i], nullptr, enemy_thread_func, &args[i]);
+        if (rc != 0) {
+            cerr << "ASP: failed to create enemy thread " << i << ": "
+                 << strerror(rc) << endl;
+            exit(1);
+        }
     }
 
     for (int i = 0; i < MAX_ENEMIES; i++)
         pthread_join(threads[i], nullptr);
 
-    munmap(gs, sizeof(GameState));
+    if (munmap(gs, sizeof(GameState)) == -1)
+        perror("ASP: munmap");
     cout << "ASP: exiting." << endl;
     return 0;
 }
