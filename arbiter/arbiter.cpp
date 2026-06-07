@@ -106,6 +106,7 @@ static void make_room(Entity& e, int size) {
 }
 
 static bool pick_up_weapon(Entity& e, int id) {
+    if (id < 0 || id >= WPN_COUNT) return false;
     int size = WPN_SLOTS[id];
     int slot = find_contiguous_slots(e, size);
     if (slot == -1) { make_room(e, size); slot = find_contiguous_slots(e, size); }
@@ -115,6 +116,7 @@ static bool pick_up_weapon(Entity& e, int id) {
 }
 
 static bool entity_has_weapon(Entity& e, int wpn_id) {
+    if (wpn_id < 0 || wpn_id >= WPN_COUNT) return false;
     for (int s = 0; s < INVENTORY_SIZE; s++)
         if (e.inventory[s] == wpn_id) return true;
     return false;
@@ -203,7 +205,7 @@ static bool pop_player_action(int player_idx, PlayerInputEvent* out) {
 
 // Shared memory + game init
 static void init_shared_memory() {
-    int fd = shm_open(SHARED_MEM_NAME, O_CREAT | O_RDWR, 0666);
+    int fd = shm_open(SHARED_MEM_NAME, O_CREAT | O_RDWR, 0600);
     if (fd == -1) { perror("shm_open"); exit(1); }
     if (ftruncate(fd, sizeof(GameState)) == -1) {
         perror("Arbiter: ftruncate"); close(fd); exit(1);
@@ -340,6 +342,7 @@ static void stamina_tick() {
 
 // Find next actor
 static int find_next_actor() {
+    pthread_mutex_lock(&gs->memory_lock);
     int best = -1, best_sta = -1;
     for (int i = 0; i < gs->num_players; i++) {
         Entity& p = gs->players[i];
@@ -351,6 +354,7 @@ static int find_next_actor() {
         if (e.is_alive && !e.is_stunned && e.stamina >= e.max_stamina)
             if (e.stamina > best_sta) { best_sta = e.stamina; best = MAX_PLAYERS + i; }
     }
+    pthread_mutex_unlock(&gs->memory_lock);
     return best;
 }
 
@@ -363,6 +367,12 @@ static void execute_action() {
     int target = gs->action_target;
     int action = gs->pending_action;
     int wpn    = gs->action_weapon_id;
+
+    if (actor < 0 || actor >= MAX_PLAYERS + MAX_ENEMIES) {
+        gs->pending_action = ACTION_NONE;
+        pthread_mutex_unlock(&gs->memory_lock);
+        return;
+    }
     bool ap    = (actor  < MAX_PLAYERS);
     auto is_valid_target = [&](int t) {
         if (t < 0) return false;
@@ -505,13 +515,15 @@ static void execute_action() {
 
 // Check win/loss + respawn 
 static void check_win_loss() {
-    if (gs->enemies_killed >= 10) { gs->is_game_over = true; gs->player_won = true; return; }
+    pthread_mutex_lock(&gs->memory_lock);
+    if (gs->enemies_killed >= 10) { gs->is_game_over = true; gs->player_won = true; pthread_mutex_unlock(&gs->memory_lock); return; }
     bool any_e = false;
     for (int i = 0; i < gs->num_enemies; i++) if (gs->enemies[i].is_alive) { any_e = true; break; }
     if (!any_e && gs->enemies_killed < 10) respawn_enemies();
     bool any_p = false;
     for (int i = 0; i < gs->num_players; i++) if (gs->players[i].is_alive) { any_p = true; break; }
     if (!any_p) { gs->is_game_over = true; gs->player_won = false; }
+    pthread_mutex_unlock(&gs->memory_lock);
 }
 
 // Deadlock monitor
@@ -1130,9 +1142,19 @@ static void* render_thread_func(void*) {
 
 //main
 int main() {
-    if (signal(SIGTERM, signal_handler) == SIG_ERR) { perror("Arbiter: signal SIGTERM"); exit(1); }
-    if (signal(SIGCHLD, signal_handler) == SIG_ERR) { perror("Arbiter: signal SIGCHLD"); exit(1); }
-    if (signal(SIGALRM, signal_handler) == SIG_ERR) { perror("Arbiter: signal SIGALRM"); exit(1); }
+    struct sigaction sa_term{}, sa_chld{}, sa_alrm{};
+    sa_term.sa_handler = signal_handler;
+    sigemptyset(&sa_term.sa_mask);
+    if (sigaction(SIGTERM, &sa_term, nullptr) == -1) { perror("Arbiter: sigaction SIGTERM"); exit(1); }
+
+    sa_chld.sa_handler = signal_handler;
+    sigemptyset(&sa_chld.sa_mask);
+    sa_chld.sa_flags = SA_NOCLDSTOP;
+    if (sigaction(SIGCHLD, &sa_chld, nullptr) == -1) { perror("Arbiter: sigaction SIGCHLD"); exit(1); }
+
+    sa_alrm.sa_handler = signal_handler;
+    sigemptyset(&sa_alrm.sa_mask);
+    if (sigaction(SIGALRM, &sa_alrm, nullptr) == -1) { perror("Arbiter: sigaction SIGALRM"); exit(1); }
 
     init_shared_memory();
     init_game();
