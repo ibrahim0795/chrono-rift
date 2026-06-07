@@ -53,6 +53,20 @@ static void  signal_handler(int);
 static void  cleanup();
 static void  trigger_stun(int entity_idx, bool is_player);
 
+// Thin wrappers around game_logic functions that handle mutex locking
+static void send_ui_event_locked(int action, int target, int weapon_id, int player_idx) {
+    pthread_mutex_lock(&gs->memory_lock);
+    send_ui_event(gs, action, target, weapon_id, player_idx);
+    pthread_mutex_unlock(&gs->memory_lock);
+}
+
+static bool pop_player_action_locked(int player_idx, PlayerInputEvent* out) {
+    pthread_mutex_lock(&gs->memory_lock);
+    bool has = pop_player_action(gs, player_idx, out);
+    pthread_mutex_unlock(&gs->memory_lock);
+    return has;
+}
+
 // Attack-trigger helper (render thread reads this to animate lunges)
 static void fire_attack_trigger(int attacker, int target) {
     pthread_mutex_lock(&atk_trig.lock);
@@ -130,23 +144,12 @@ static void trigger_stun(int entity_idx, bool is_player) {
     pthread_detach(ct);
 }
 
-// send_ui_event and pop_player_action wrappers (lock-aware)
-static void send_ui_event_locked(int action, int target, int weapon_id, int player_idx) {
-    pthread_mutex_lock(&gs->memory_lock);
-    send_ui_event(gs, action, target, weapon_id, player_idx);
-    pthread_mutex_unlock(&gs->memory_lock);
-}
-
-static bool pop_player_action_locked(int player_idx, PlayerInputEvent* out) {
-    pthread_mutex_lock(&gs->memory_lock);
-    bool has = pop_player_action(gs, player_idx, out);
-    pthread_mutex_unlock(&gs->memory_lock);
-    return has;
-}
+// send_ui_event and pop_player_action now live in game_logic.cpp
+// (wrapped by send_ui_event_locked / pop_player_action_locked above)
 
 // Shared memory + game init
 static void init_shared_memory() {
-    int fd = shm_open(SHARED_MEM_NAME, O_CREAT | O_RDWR, 0666);
+    int fd = shm_open(SHARED_MEM_NAME, O_CREAT | O_RDWR, 0600);
     if (fd == -1) { perror("shm_open"); exit(1); }
     if (ftruncate(fd, sizeof(GameState)) == -1) {
         perror("Arbiter: ftruncate"); close(fd); exit(1);
@@ -262,6 +265,12 @@ static void execute_action() {
     int target = gs->action_target;
     int action = gs->pending_action;
     int wpn    = gs->action_weapon_id;
+
+    if (actor < 0 || actor >= MAX_PLAYERS + MAX_ENEMIES) {
+        gs->pending_action = ACTION_NONE;
+        pthread_mutex_unlock(&gs->memory_lock);
+        return;
+    }
     bool ap    = (actor  < MAX_PLAYERS);
     auto is_valid_target = [&](int t) {
         if (t < 0) return false;
@@ -1020,9 +1029,19 @@ static void* render_thread_func(void*) {
 
 //main
 int main() {
-    if (signal(SIGTERM, signal_handler) == SIG_ERR) { perror("Arbiter: signal SIGTERM"); exit(1); }
-    if (signal(SIGCHLD, signal_handler) == SIG_ERR) { perror("Arbiter: signal SIGCHLD"); exit(1); }
-    if (signal(SIGALRM, signal_handler) == SIG_ERR) { perror("Arbiter: signal SIGALRM"); exit(1); }
+    struct sigaction sa_term{}, sa_chld{}, sa_alrm{};
+    sa_term.sa_handler = signal_handler;
+    sigemptyset(&sa_term.sa_mask);
+    if (sigaction(SIGTERM, &sa_term, nullptr) == -1) { perror("Arbiter: sigaction SIGTERM"); exit(1); }
+
+    sa_chld.sa_handler = signal_handler;
+    sigemptyset(&sa_chld.sa_mask);
+    sa_chld.sa_flags = SA_NOCLDSTOP;
+    if (sigaction(SIGCHLD, &sa_chld, nullptr) == -1) { perror("Arbiter: sigaction SIGCHLD"); exit(1); }
+
+    sa_alrm.sa_handler = signal_handler;
+    sigemptyset(&sa_alrm.sa_mask);
+    if (sigaction(SIGALRM, &sa_alrm, nullptr) == -1) { perror("Arbiter: sigaction SIGALRM"); exit(1); }
 
     init_shared_memory();
     init_game();
