@@ -35,7 +35,7 @@ static void attach_shared_memory() {
     gs = (GameState*)mmap(nullptr, sizeof(GameState),
                           PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (gs == MAP_FAILED) { perror("HIP: mmap"); exit(1); }
-    close(fd);
+    if (close(fd) == -1) perror("HIP: close shm fd");
 }
 
 static void push_player_action(int player_idx, int action, int target, int weapon_id)
@@ -51,6 +51,9 @@ static void push_player_action(int player_idx, int action, int target, int weapo
         ev.valid     = true;
         buf.tail  = (buf.tail + 1) % ACTION_BUF_CAP;
         buf.count++;
+    } else {
+        cerr << "HIP: action buffer full for player " << player_idx
+             << " — dropped action " << action << endl;
     }
     pthread_mutex_unlock(&gs->memory_lock);
 }
@@ -68,7 +71,8 @@ static void* player_thread_func(void* arg) {
     sigset_t unblock;
     sigemptyset(&unblock);
     sigaddset(&unblock, SIGUSR1);
-    pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
+    if (pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr) != 0)
+        perror("HIP: pthread_sigmask SIG_UNBLOCK");
 
     cout << "HIP: Player " << idx + 1
          << " thread ready  (tid=" << pthread_self() << ")" << endl;
@@ -123,15 +127,21 @@ int main() {
     sigset_t block_usr1;
     sigemptyset(&block_usr1);
     sigaddset(&block_usr1, SIGUSR1);
-    pthread_sigmask(SIG_BLOCK, &block_usr1, nullptr);
+    if (pthread_sigmask(SIG_BLOCK, &block_usr1, nullptr) != 0) {
+        perror("HIP: pthread_sigmask SIG_BLOCK"); exit(1);
+    }
 
     struct sigaction sa{};
     sa.sa_handler = stun_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags   = 0;   // no SA_RESTART
-    sigaction(SIGUSR1, &sa, nullptr);
+    if (sigaction(SIGUSR1, &sa, nullptr) == -1) {
+        perror("HIP: sigaction SIGUSR1"); exit(1);
+    }
 
-    signal(SIGTERM, sigterm_handler);
+    if (signal(SIGTERM, sigterm_handler) == SIG_ERR) {
+        perror("HIP: signal SIGTERM"); exit(1);
+    }
 
     // Attach to shared memory created by Arbiter
     cout << "HIP: Connecting to shared memory..." << endl;
@@ -159,7 +169,12 @@ int main() {
 
     for (int i = 0; i < gs->num_players; i++) {
         args[i].player_idx = i;
-        pthread_create(&tids[i], nullptr, player_thread_func, &args[i]);
+        int rc = pthread_create(&tids[i], nullptr, player_thread_func, &args[i]);
+        if (rc != 0) {
+            cerr << "HIP: failed to create player thread " << i << ": "
+                 << strerror(rc) << endl;
+            exit(1);
+        }
     }
 
     // Wait for game end or SIGTERM 
@@ -171,7 +186,8 @@ int main() {
     for (int i = 0; i < gs->num_players; i++)
         pthread_join(tids[i], nullptr);
 
-    munmap(gs, sizeof(GameState));
+    if (munmap(gs, sizeof(GameState)) == -1)
+        perror("HIP: munmap");
     cout << "HIP: exiting." << endl;
     return 0;
 }
